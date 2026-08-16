@@ -13,6 +13,12 @@ This program covers six related problems:
 5. frontends mutating otherwise reusable prefixes;
 6. the tooling and performance-maturity gap versus CUDA serving.
 
+## Active investigation
+
+The first profiler is now in-tree at `tools/benchmark/gdn_align_cold_scaling.py` and runs through `.github/workflows/gdn-align-cold-scaling.yml`.
+
+It compares cache-off and cache-on in separate processes, submits deterministically unique prompts so no prefix hit can hide the cold-path cost, measures a new probe after progressively larger retained working sets, records TTFT/decode/wall throughput and MLX memory, and traces `GDNPagedStateCache.ensure_capacity()` growth. The purpose is to correlate the all-cold slowdown with the align-mode state pool before changing the ownership model.
+
 ## Evidence already in the ecosystem
 
 - Hybrid Qwen prefix caching is functional, but upstream vllm-metal PR #584 measured cache-on all-cold unique-prompt throughput at only 0.38x cache-off at concurrency 1 and 0.80x at concurrency 8. Its CUDA control stayed near parity, identifying an MLX worker/state-layout problem rather than an inherent prefix-caching tax.
