@@ -3,7 +3,11 @@ name: Qwen MTP Serving Benchmark
 on:
   push:
     branches: [pr/610-05-paged-qwen-mtp-prefix]
-    paths: [.github/workflows/qwen-mtp-serving-bench.yml]
+    paths:
+      - .github/workflows/qwen-mtp-serving-bench.yml
+      - vllm_metal/v1/proposer.py
+      - vllm_metal/v1/qwen_mtp_paged.py
+      - vllm_metal/attention/runtime/hybrid.py
 
 permissions:
   contents: read
@@ -113,9 +117,6 @@ jobs:
               total += 1
               accepted += int(from_draft)
           elapsed = time.perf_counter() - started
-          # One non-draft token closes each speculative attempt (bonus on
-          # acceptance, replacement on rejection), plus the initial backbone
-          # token before the first draft exists.
           attempts = max(0, total - accepted - 1)
           result = {
               'output_tokens': total,
@@ -221,7 +222,6 @@ jobs:
                       )
                       return output
 
-                  # Populate the shared target/MTP prefix before measuring.
                   await one('warmup')
                   before = await fetch_spec_decode_metrics(base, session)
 
