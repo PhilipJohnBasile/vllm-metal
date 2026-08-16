@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MULTIMODAL_MODE: str = "auto"
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
+    VLLM_METAL_GDN_DEFER_DECODE_STATE: bool = False
     VLLM_METAL_DECODE_PIPELINE: bool = True
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
@@ -58,6 +59,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to "0" to force the eager conv / C++ recurrent fallback path.
     "VLLM_METAL_GDN_LAZY_KERNELS": lambda: (
         os.getenv("VLLM_METAL_GDN_LAZY_KERNELS", "1") == "1"
+    ),
+    # Experimental compact decode-state handoff. When enabled, lazy GDN decode
+    # keeps active conv/recurrent updates compact and flushes them into the
+    # scheduler-indexed checkpoint pool only at state-motion or checkpoint
+    # boundaries. Off by default until the serving A/B gate is complete.
+    "VLLM_METAL_GDN_DEFER_DECODE_STATE": lambda: (
+        os.getenv("VLLM_METAL_GDN_DEFER_DECODE_STATE", "0") == "1"
     ),
     # One-step-ahead decode pipelining (default on). Eligible pure-decode
     # greedy steps defer the sampling sync one step so the next step's graph
