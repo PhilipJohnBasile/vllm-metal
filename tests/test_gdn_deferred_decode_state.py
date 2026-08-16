@@ -76,6 +76,49 @@ def _lazy() -> GDNLazyKernels:
     )
 
 
+def _two_request_manager() -> tuple[GDNPagedStateCache, AlignGDNStateManager]:
+    cache = _cache()
+    manager = AlignGDNStateManager(cache, block_size=4)
+    ctx = PagedAttentionContext(
+        slot_mapping=[],
+        cu_seqlens=[0, 1, 2],
+        num_decode_requests=2,
+    )
+    manager.populate_step_context(
+        req_ids=["left", "right"],
+        ctx=ctx,
+        state_block_ids=[[[2, 3, 4]], [[5, 6, 7]]],
+        step_positions=[(5, 1), (5, 1)],
+    )
+    assert ctx.gdn_group_slot_mappings == ([3, 6],)
+    return cache, manager
+
+
+def _set_two_pending_rows(cache: GDNPagedStateCache) -> None:
+    cache.set_pending_conv_state(
+        0,
+        [3, 6],
+        mx.array(
+            [
+                [[7.0, 7.0, 7.0, 7.0]],
+                [[8.0, 8.0, 8.0, 8.0]],
+            ],
+            dtype=mx.float32,
+        ),
+    )
+    cache.set_pending_recurrent_state(
+        0,
+        [3, 6],
+        mx.concatenate(
+            [
+                mx.full((1, 1, 4, 32), 9, dtype=mx.float32),
+                mx.full((1, 1, 4, 32), 10, dtype=mx.float32),
+            ],
+            axis=0,
+        ),
+    )
+
+
 def test_decode_replaces_compact_conv_state_without_touching_pool() -> None:
     cache = _cache()
     pool = cache.conv_states[0]
@@ -192,6 +235,7 @@ def test_same_block_align_step_does_not_drain_pending_state() -> None:
     assert cache.has_pending_conv_state(0)
     assert cache.has_pending_recurrent_state(0)
     assert ctx.gdn_group_slot_mappings == ([3],)
+    assert manager._deferred_gdn_request_slots == {"req": (3,)}
     assert not manager._deferred_gdn_flush_after_step
 
 
@@ -221,5 +265,83 @@ def test_block_transition_flushes_pending_state_before_copy() -> None:
     assert not cache.has_pending_conv_state(0)
     assert not cache.has_pending_recurrent_state(0)
     assert ctx.gdn_group_slot_mappings == ([4],)
+    assert manager._deferred_gdn_request_slots == {"req": (4,)}
     np.testing.assert_allclose(np.array(cache.conv_states[0][4]), 7)
     np.testing.assert_allclose(np.array(cache.recurrent_states[0][4]), 9)
+
+
+def test_release_prunes_one_compact_row_without_touching_pool() -> None:
+    cache, manager = _two_request_manager()
+    _set_two_pending_rows(cache)
+
+    manager.release_requests({"left"})
+
+    assert manager._deferred_gdn_request_slots == {"right": (6,)}
+    assert cache.pending_conv_slot_ids[0] == [6]
+    assert cache.pending_recurrent_slot_ids[0] == [6]
+    np.testing.assert_allclose(np.array(cache.pending_conv_state(0, [6])), 8)
+    np.testing.assert_allclose(np.array(cache.pending_recurrent_state(0, [6])), 10)
+    np.testing.assert_allclose(np.array(cache.conv_states[0][3]), 0)
+    np.testing.assert_allclose(np.array(cache.conv_states[0][6]), 0)
+    np.testing.assert_allclose(np.array(cache.recurrent_states[0][3]), 0)
+    np.testing.assert_allclose(np.array(cache.recurrent_states[0][6]), 0)
+    assert not getattr(manager, "_deferred_gdn_force_flush", False)
+
+
+def test_release_prunes_all_compact_rows_without_pool_flush() -> None:
+    cache, manager = _two_request_manager()
+    _set_two_pending_rows(cache)
+
+    manager.release_requests({"left", "right"})
+
+    assert manager._deferred_gdn_request_slots == {}
+    assert not cache.has_pending_conv_state(0)
+    assert not cache.has_pending_recurrent_state(0)
+    np.testing.assert_allclose(np.array(cache.conv_states[0][3]), 0)
+    np.testing.assert_allclose(np.array(cache.conv_states[0][6]), 0)
+    np.testing.assert_allclose(np.array(cache.recurrent_states[0][3]), 0)
+    np.testing.assert_allclose(np.array(cache.recurrent_states[0][6]), 0)
+    assert not getattr(manager, "_deferred_gdn_force_flush", False)
+
+
+def test_release_keeps_row_still_owned_by_another_request() -> None:
+    cache = _cache()
+    manager = AlignGDNStateManager(cache, block_size=4)
+    manager._deferred_gdn_request_slots = {
+        "left": (3,),
+        "right": (3,),
+    }
+    cache.set_pending_conv_state(
+        0, [3], mx.full((1, 1, 4), 7, dtype=mx.float32)
+    )
+    cache.set_pending_recurrent_state(
+        0, [3], mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
+    )
+
+    manager.release_requests({"left"})
+
+    assert manager._deferred_gdn_request_slots == {"right": (3,)}
+    assert cache.has_pending_conv_state(0)
+    assert cache.has_pending_recurrent_state(0)
+    np.testing.assert_allclose(np.array(cache.pending_conv_state(0, [3])), 7)
+    np.testing.assert_allclose(np.array(cache.pending_recurrent_state(0, [3])), 9)
+
+
+def test_missing_release_mapping_retains_safe_force_flush_fallback() -> None:
+    cache = _cache()
+    manager = AlignGDNStateManager(cache, block_size=4)
+    cache.set_pending_conv_state(
+        0, [3], mx.full((1, 1, 4), 7, dtype=mx.float32)
+    )
+    cache.set_pending_recurrent_state(
+        0, [3], mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
+    )
+
+    manager.release_requests({"unknown"})
+
+    assert manager._deferred_gdn_force_flush
+    manager.materialize_pending_state()
+    assert not cache.has_pending_conv_state(0)
+    assert not cache.has_pending_recurrent_state(0)
+    np.testing.assert_allclose(np.array(cache.conv_states[0][3]), 7)
+    np.testing.assert_allclose(np.array(cache.recurrent_states[0][3]), 9)
