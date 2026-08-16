@@ -50,6 +50,7 @@ def _build_linear_layer_spec(
     page_size_padded: int | None = None,
     mamba_block_size: int,
     mamba_cache_mode: str = "none",
+    num_speculative_blocks: int = 0,
 ) -> MambaSpec:
     """Build the scheduler-visible GDN state spec.
 
@@ -66,6 +67,7 @@ def _build_linear_layer_spec(
         page_size_padded=page_size_padded,
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
         mamba_cache_mode=mamba_cache_mode,
+        num_speculative_blocks=num_speculative_blocks,
     )
 
 
@@ -96,6 +98,8 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         dtype: mx.Dtype,
         # Scheduler-side mamba caching strategy ("none" or "align").
         mamba_cache_mode: str = "none",
+        # One scheduler-owned GDN snapshot block per possible draft token.
+        num_speculative_blocks: int = 0,
         # TurboQuant (SDPA layers only)
         turboquant: bool = False,
         k_quant: str | None = None,
@@ -110,6 +114,9 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
                 f"{mamba_cache_mode!r} (only 'none' and 'align')"
             )
         self._mamba_cache_mode = mamba_cache_mode
+        if num_speculative_blocks < 0:
+            raise ValueError("num_speculative_blocks must be non-negative")
+        self._num_speculative_blocks = num_speculative_blocks
 
         # SDPA params
         self._num_kv_heads = num_kv_heads
@@ -181,7 +188,11 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             dtype=self._dtype,
         )
         self._gdn_state_manager = (
-            AlignGDNStateManager(self._state_cache, self._block_size)
+            AlignGDNStateManager(
+                self._state_cache,
+                self._block_size,
+                self._num_speculative_blocks,
+            )
             if align
             else HybridGDNStateManager(self._state_cache)
         )
@@ -325,6 +336,25 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             ctx=ctx,
             state_block_ids=state_block_ids,
             step_positions=step_positions,
+        )
+
+    def commit_speculative_state(
+        self,
+        *,
+        req_ids: list[str],
+        state_block_ids: list[list[list[int]]],
+        step_positions: list[tuple[int, int]],
+        num_sampled_tokens: list[int],
+    ) -> None:
+        if not isinstance(self.gdn_state_manager, AlignGDNStateManager):
+            raise RuntimeError(
+                "scheduler-owned speculative GDN state requires mamba_cache_mode='align'"
+            )
+        self.gdn_state_manager.commit_speculative_state(
+            req_ids=req_ids,
+            state_block_ids=state_block_ids,
+            step_positions=step_positions,
+            num_sampled_tokens=num_sampled_tokens,
         )
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:

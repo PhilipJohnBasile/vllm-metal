@@ -368,6 +368,7 @@ class ModelCachePolicy:
                     page_size_padded=cache_config.mamba_page_size_padded,
                     mamba_block_size=mamba_block_size,
                     mamba_cache_mode=cache_config.mamba_cache_mode,
+                    num_speculative_blocks=self._num_speculative_blocks(),
                 )
             elif use_turboquant:
                 layer_name = f"layers.{layer_idx}.self_attn"
@@ -796,13 +797,13 @@ class ModelCachePolicy:
         MambaSpec carries ``mamba_page_size_padded`` — an unpadded estimate
         falls short of that requirement by the padding margin.
         """
-        # Mirrors MambaSpec.max_memory_usage_bytes with zero speculative
-        # blocks and mamba_cache_mode "none"; if vLLM's defaults change,
-        # this mirror must follow.
+        # Mirrors MambaSpec.max_memory_usage_bytes in mamba_cache_mode
+        # "none": one live state plus one snapshot per speculative token.
+        multiplier = 1 + self._num_speculative_blocks()
         padded = self._runner.cache_config.mamba_page_size_padded
         if padded is not None:
-            return self._runner.num_linear_layers * padded
-        return self.linear_cache_bytes_per_slot()
+            return self._runner.num_linear_layers * padded * multiplier
+        return self.linear_cache_bytes_per_slot() * multiplier
 
     def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionRuntime:
         config = get_config()
@@ -820,6 +821,7 @@ class ModelCachePolicy:
             block_size=block_size,
             dtype=self._require_kv_cache_dtype(),
             mamba_cache_mode=self._runner.cache_config.mamba_cache_mode,
+            num_speculative_blocks=self._num_speculative_blocks(),
             turboquant=config.turboquant,
             k_quant=config.k_quant if config.turboquant else None,
             v_quant=config.v_quant if config.turboquant else None,
@@ -942,6 +944,12 @@ class ModelCachePolicy:
             self._runner.num_layers,
         )
         return num_cache_layers, cache_idx_map
+
+    def _num_speculative_blocks(self) -> int:
+        speculative_config = self._runner.vllm_config.speculative_config
+        if speculative_config is None:
+            return 0
+        return int(speculative_config.num_speculative_tokens or 0)
 
     def _require_kv_cache_dtype(self) -> mx.Dtype:
         if self._runner.kv_cache_dtype is None:
