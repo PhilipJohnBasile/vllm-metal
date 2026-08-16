@@ -21,6 +21,7 @@ jobs:
     env:
       GLOO_SOCKET_IFNAME: lo0
       VLLM_ENABLE_V1_MULTIPROCESSING: "0"
+      RESULT_DIR: /tmp/kv-offload-port
     steps:
       - uses: actions/checkout@v5
         with:
@@ -54,14 +55,32 @@ jobs:
           print(MetalOffloadingSpec, MetalTieringOffloadingSpec)
           PY
       - name: Run portable focused tests
+        id: focused
         shell: bash
         run: |
-          set -euxo pipefail
+          set +e
           source .venv/bin/activate
-          pytest -q \
+          rm -rf "$RESULT_DIR"
+          mkdir -p "$RESULT_DIR"
+          pytest -ra -vv \
             tests/test_kv_offload_config.py \
             tests/test_kv_offload_cuda_parity.py \
             tests/test_kv_offload_fs_tier.py \
             tests/test_kv_offload_tiering.py \
             tests/test_kv_offload_worker.py \
-            tests/test_memory_guard.py
+            tests/test_memory_guard.py \
+            2>&1 | tee "$RESULT_DIR/pytest.log"
+          status=${PIPESTATUS[0]}
+          echo "$status" > "$RESULT_DIR/status"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Upload KV offload port diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kv-offload-port-diagnostics
+          path: ${{ env.RESULT_DIR }}
+          if-no-files-found: warn
+      - name: Fail when focused tests failed
+        if: steps.focused.outputs.status != '0'
+        run: exit 1
