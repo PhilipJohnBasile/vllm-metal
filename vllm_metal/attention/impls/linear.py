@@ -13,7 +13,7 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.gated_delta import compute_g
+from mlx_lm.models.gated_delta import compute_g, gated_delta_kernel
 
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.attention.context import PagedAttentionContext, get_context
@@ -45,6 +45,9 @@ class _GDNForwardState:
     total_tokens: int
     slot_ids: list[int]
     num_decode_requests: int
+    # Per request: [initial, after_token_0, ..., after_token_K]. Empty
+    # entries retain the ordinary one-destination path.
+    state_chains: list[list[int]] | None = None
 
 
 @dataclass(frozen=True)
@@ -168,6 +171,25 @@ class GDNPagedAttentionWrapper(nn.Module):
             raise RuntimeError("GDN wrapper requires unique slots per request")
         self._gdn_state_cache.require_allocated_slots(slot_ids)
 
+        state_chains = None
+        if ctx.gdn_group_state_chains is not None:
+            ordinal = self._gdn_state_cache.layer_group_ordinal(self._gdn_cache_idx)
+            state_chains = ctx.gdn_group_state_chains[ordinal]
+            if len(state_chains) != num_requests:
+                raise RuntimeError(
+                    "GDN wrapper requires one speculative state chain per request"
+                )
+            for req_idx, chain in enumerate(state_chains):
+                if not chain:
+                    continue
+                request_tokens = cu_seqlens[req_idx + 1] - cu_seqlens[req_idx]
+                if len(chain) != request_tokens + 1:
+                    raise RuntimeError(
+                        f"GDN request {req_idx} has {request_tokens} input tokens "
+                        f"but a {len(chain)}-entry state chain"
+                    )
+                self._gdn_state_cache.require_allocated_slots(chain)
+
         return _GDNForwardState(
             x=x,
             cu_seqlens=cu_seqlens,
@@ -175,6 +197,7 @@ class GDNPagedAttentionWrapper(nn.Module):
             total_tokens=x.shape[1],
             slot_ids=slot_ids,
             num_decode_requests=ctx.num_decode_requests,
+            state_chains=state_chains,
         )
 
     def _project_inputs(
@@ -212,6 +235,9 @@ class GDNPagedAttentionWrapper(nn.Module):
 
     def _run_conv(self, mixed_qkv: mx.array, state: _GDNForwardState) -> mx.array:
         # === Step 2: Conv1d (per-request, needs conv_state) ===
+        if state.state_chains is not None and any(state.state_chains):
+            return self._run_conv_state_chains(mixed_qkv, state)
+
         inner = self._inner
         state_cache = self._gdn_state_cache
         cache_idx = self._gdn_cache_idx
@@ -271,6 +297,54 @@ class GDNPagedAttentionWrapper(nn.Module):
 
         return mx.concatenate(conv_outputs, axis=1)
 
+    def _run_conv_state_chains(
+        self, mixed_qkv: mx.array, state: _GDNForwardState
+    ) -> mx.array:
+        """Produce an observable conv-state checkpoint after every token.
+
+        This is the correctness-first path for speculative verification. It is
+        intentionally request/token sequential; ordinary decode and prefill
+        remain on their existing fused/lazy kernels.
+        """
+        inner = self._inner
+        state_cache = self._gdn_state_cache
+        cache_idx = self._gdn_cache_idx
+        state_cache.apply_pending_conv_state(cache_idx)
+        pool = state_cache.conv_states[cache_idx]
+        outputs: list[mx.array] = []
+
+        assert state.state_chains is not None
+        for req_idx in range(state.num_requests):
+            start = state.cu_seqlens[req_idx]
+            end = state.cu_seqlens[req_idx + 1]
+            request_qkv = mixed_qkv[:, start:end, :]
+            chain = state.state_chains[req_idx]
+
+            if not chain:
+                slot = state.slot_ids[req_idx]
+                conv_state = pool[slot : slot + 1]
+                conv_input = mx.concatenate([conv_state, request_qkv], axis=1)
+                new_conv = conv_input[:, -(inner.conv_kernel_size - 1) :]
+                pool[slot : slot + 1] = new_conv
+                conv_out = nn.silu(inner.conv1d(conv_input))
+                outputs.append(conv_out[:, -(end - start) :, :])
+                continue
+
+            conv_state = pool[chain[0] : chain[0] + 1]
+            request_outputs: list[mx.array] = []
+            for token_offset, dst in enumerate(chain[1:]):
+                token_qkv = request_qkv[:, token_offset : token_offset + 1, :]
+                conv_input = mx.concatenate([conv_state, token_qkv], axis=1)
+                new_conv = conv_input[:, -(inner.conv_kernel_size - 1) :]
+                pool[dst : dst + 1] = new_conv
+                conv_state = new_conv
+                conv_out = nn.silu(inner.conv1d(conv_input))
+                request_outputs.append(conv_out[:, -1:, :])
+            outputs.append(mx.concatenate(request_outputs, axis=1))
+
+        state_cache.store_conv_state(cache_idx, pool)
+        return mx.concatenate(outputs, axis=1)
+
     def _split_and_normalize(
         self, conv_packed: mx.array, state: _GDNForwardState
     ) -> tuple[mx.array, mx.array, mx.array]:
@@ -313,6 +387,9 @@ class GDNPagedAttentionWrapper(nn.Module):
         state: _GDNForwardState,
     ) -> mx.array:
         # === Step 5: Batched recurrent update ===
+        if state.state_chains is not None and any(state.state_chains):
+            return self._run_recurrent_state_chains(q, k, v, g, beta, state)
+
         if state.num_decode_requests == state.num_requests:
             request = GDNRecurrentDecodeRequest(
                 q=q,
@@ -350,6 +427,62 @@ class GDNPagedAttentionWrapper(nn.Module):
                 return y_flat
         self._gdn_state_cache.apply_pending_recurrent_state(self._gdn_cache_idx)
         return self._run_recurrent_fallback(q, k, v, g, beta, state)
+
+    def _run_recurrent_state_chains(
+        self,
+        q: mx.array,
+        k: mx.array,
+        v: mx.array,
+        g: mx.array,
+        beta: mx.array,
+        state: _GDNForwardState,
+    ) -> mx.array:
+        """Produce one recurrent-state snapshot per verification token."""
+        state_cache = self._gdn_state_cache
+        cache_idx = self._gdn_cache_idx
+        state_cache.apply_pending_recurrent_state(cache_idx)
+        pool = state_cache.recurrent_states[cache_idx]
+        outputs: list[mx.array] = []
+
+        assert state.state_chains is not None
+        for req_idx in range(state.num_requests):
+            start = state.cu_seqlens[req_idx]
+            end = state.cu_seqlens[req_idx + 1]
+            chain = state.state_chains[req_idx]
+
+            if not chain:
+                slot = state.slot_ids[req_idx]
+                request_output, new_state = gated_delta_kernel(
+                    q[:, start:end],
+                    k[:, start:end],
+                    v[:, start:end],
+                    g[:, start:end],
+                    beta[:, start:end],
+                    pool[slot : slot + 1],
+                )
+                pool[slot : slot + 1] = new_state
+                outputs.append(request_output.reshape(end - start, *v.shape[2:]))
+                continue
+
+            recurrent_state = pool[chain[0] : chain[0] + 1]
+            request_outputs: list[mx.array] = []
+            for token_offset, dst in enumerate(chain[1:]):
+                token = start + token_offset
+                token_output, new_state = gated_delta_kernel(
+                    q[:, token : token + 1],
+                    k[:, token : token + 1],
+                    v[:, token : token + 1],
+                    g[:, token : token + 1],
+                    beta[:, token : token + 1],
+                    recurrent_state,
+                )
+                pool[dst : dst + 1] = new_state
+                recurrent_state = new_state
+                request_outputs.append(token_output.reshape(1, *v.shape[2:]))
+            outputs.append(mx.concatenate(request_outputs, axis=0))
+
+        state_cache.store_recurrent_state(cache_idx, pool)
+        return mx.concatenate(outputs, axis=0).astype(state.x.dtype)
 
     def _should_try_recurrent_prefill_containing_lazy(
         self, state: _GDNForwardState
