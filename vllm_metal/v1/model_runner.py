@@ -1650,6 +1650,16 @@ class MetalModelRunner:
             vocab_size=vocab_size,
         )
 
+        # The target forward has now produced one GDN checkpoint per
+        # verification input token, and the verifier has chosen how many output
+        # tokens to commit. Promote the matching scheduler-owned recurrent state
+        # before request lengths or block ownership advance.
+        self._commit_hybrid_speculative_state(
+            decode_reqs=decode_reqs,
+            decode_segments=decode_segments,
+            decode_token_ids=decode_token_ids,
+        )
+
         # ---- update decode state ----
         for i, (req_id, state) in enumerate(decode_reqs):
             sampled_ids = decode_token_ids[i]
@@ -1836,6 +1846,81 @@ class MetalModelRunner:
             if state is not None and state.generated_tokens > 0:
                 decode_reqs.append((req_id, state))
         return tuple(decode_reqs)
+
+    def _commit_hybrid_speculative_state(
+        self,
+        *,
+        decode_reqs: list[tuple[str, RequestState]],
+        decode_segments: tuple[PagedDecodeSegment, ...],
+        decode_token_ids: list[list[int]],
+    ) -> None:
+        """Promote verifier-selected state in an align-mode hybrid runtime.
+
+        ``decode_token_ids[i]`` contains the verifier's emitted sequence for
+        request ``i``. Its length is the universal recurrent-state selector:
+        state snapshot ``len(sampled_ids) - 1``.
+        """
+        runtime = self._paged_attention_runtime
+        if runtime is None or not self.is_hybrid:
+            return
+        if not any(segment.draft_token_ids for segment in decode_segments):
+            return
+        if self.cache_config.mamba_cache_mode != "align":
+            raise RuntimeError(
+                "hybrid speculative state promotion requires mamba_cache_mode='align'"
+            )
+        if not (len(decode_reqs) == len(decode_segments) == len(decode_token_ids)):
+            raise RuntimeError("decode speculation metadata length mismatch")
+
+        req_ids: list[str] = []
+        state_block_ids: list[list[list[int]]] = []
+        step_positions: list[tuple[int, int]] = []
+        num_sampled_tokens: list[int] = []
+        for (req_id, _), segment, sampled_ids in zip(
+            decode_reqs, decode_segments, decode_token_ids, strict=True
+        ):
+            if not segment.draft_token_ids:
+                continue
+            if req_id != segment.req_id:
+                raise RuntimeError(
+                    "hybrid speculative state promotion received mismatched "
+                    f"request metadata: {req_id!r} != {segment.req_id!r}"
+                )
+            sampled = len(sampled_ids)
+            if sampled < 1 or sampled > segment.num_query_tokens:
+                raise RuntimeError(
+                    f"request {req_id!r} emitted {sampled} tokens for a "
+                    f"{segment.num_query_tokens}-token verification window"
+                )
+            try:
+                request_state_blocks = self._state_block_ids_by_req[req_id]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"no scheduler-owned GDN block table for {req_id!r}"
+                ) from exc
+
+            req_ids.append(req_id)
+            state_block_ids.append(request_state_blocks)
+            step_positions.append((segment.cache_start_pos, segment.num_query_tokens))
+            num_sampled_tokens.append(sampled)
+
+        if not req_ids:
+            return
+
+        commit = getattr(runtime, "commit_speculative_state", None)
+        if commit is None:
+            raise RuntimeError(
+                "hybrid runtime does not implement speculative GDN state promotion"
+            )
+        commit(
+            req_ids=req_ids,
+            state_block_ids=state_block_ids,
+            step_positions=step_positions,
+            num_sampled_tokens=num_sampled_tokens,
+        )
+        # The promotion copy is a lazy MLX state mutation. Materialize it before
+        # the scheduler can reuse, evict, preempt, or copy those blocks.
+        runtime.materialize_pending_state()
 
     def _validate_spec_decode_supported(
         self,
