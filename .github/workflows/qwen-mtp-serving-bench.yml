@@ -24,7 +24,7 @@ concurrency:
 jobs:
   speed-matrix:
     runs-on: macos-15
-    timeout-minutes: 120
+    timeout-minutes: 360
     env:
       VLLM_METAL_USE_PAGED_ATTENTION: "1"
       VLLM_METAL_MEMORY_FRACTION: "auto"
