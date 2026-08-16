@@ -12,17 +12,74 @@ on:
           - "2"
           - "3"
           - "5"
+  schedule:
+    # One-time fallback window: 2026-08-16 21:15 America/New_York.
+    # The preflight year/date guard makes later annual matches no-ops.
+    - cron: "15 1 17 8 *"
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: qwen-mtp-speed-shards-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      run_shards: ${{ steps.decide.outputs.run_shards }}
+      repeats: ${{ steps.decide.outputs.repeats }}
+    steps:
+      - id: decide
+        name: Decide whether fallback shards are needed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          MANUAL_REPEATS: ${{ inputs.repeats }}
+          MONOLITHIC_RUN_ID: "31966399394"
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "run_shards=true" >> "$GITHUB_OUTPUT"
+            echo "repeats=${MANUAL_REPEATS:-2}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "repeats=2" >> "$GITHUB_OUTPUT"
+          if [ "$(date -u +%F)" != "2026-08-17" ]; then
+            echo "run_shards=false" >> "$GITHUB_OUTPUT"
+            echo "Scheduled fallback is outside its one-time date guard."
+            exit 0
+          fi
+
+          payload="$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${MONOLITHIC_RUN_ID}")"
+          read -r status conclusion < <(
+            python -c 'import json,sys; d=json.load(sys.stdin); print(d.get("status", "unknown"), d.get("conclusion") or "none")' \
+              <<<"$payload"
+          )
+          echo "Monolithic run status=${status} conclusion=${conclusion}"
+
+          if [ "$status" = "completed" ] && [ "$conclusion" = "success" ]; then
+            echo "run_shards=false" >> "$GITHUB_OUTPUT"
+            echo "Monolithic matrix succeeded; fallback shards are unnecessary."
+          elif [ "$status" = "completed" ]; then
+            echo "run_shards=true" >> "$GITHUB_OUTPUT"
+            echo "Monolithic matrix completed without success; launching shards."
+          else
+            echo "run_shards=false" >> "$GITHUB_OUTPUT"
+            echo "Monolithic matrix is still active; avoiding duplicate load."
+          fi
+
   speed-matrix-shard:
     name: shard-${{ matrix.shard }}
+    needs: preflight
+    if: needs.preflight.outputs.run_shards == 'true'
     runs-on: macos-15
     timeout-minutes: 240
     continue-on-error: true
@@ -106,7 +163,7 @@ jobs:
             echo "mlx_lm_mtp_sha=${MLX_LM_MTP_SHA}"
             echo "shard=${{ matrix.shard }}"
             echo "profiles=${QWEN_MTP_PROFILE_NAMES}"
-            echo "repeats=${{ inputs.repeats }}"
+            echo "repeats=${{ needs.preflight.outputs.repeats }}"
             sw_vers
             uname -a
             sysctl -n machdep.cpu.brand_string || true
@@ -123,7 +180,7 @@ jobs:
           python benchmarks/qwen_mtp_speed_matrix_shard.py \
             --model-dir "$MODEL_DIR" \
             --output-dir "$MATRIX_DIR" \
-            --repeats "${{ inputs.repeats }}" \
+            --repeats "${{ needs.preflight.outputs.repeats }}" \
             --request-timeout-s 240 \
             --server-ready-timeout-s 720 \
             2>&1 | tee "$MATRIX_DIR/run.log"
@@ -157,8 +214,10 @@ jobs:
   aggregate:
     name: aggregate-shards
     runs-on: ubuntu-latest
-    if: always()
-    needs: speed-matrix-shard
+    if: always() && needs.preflight.outputs.run_shards == 'true'
+    needs:
+      - preflight
+      - speed-matrix-shard
     permissions:
       actions: read
       contents: read
