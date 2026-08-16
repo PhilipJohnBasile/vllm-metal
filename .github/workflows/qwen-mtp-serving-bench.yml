@@ -8,6 +8,7 @@ on:
       - vllm_metal/v1/proposer.py
       - vllm_metal/v1/qwen_mtp_paged.py
       - vllm_metal/attention/runtime/hybrid.py
+      - vllm_metal/attention/impls/linear.py
 
 permissions:
   contents: read
