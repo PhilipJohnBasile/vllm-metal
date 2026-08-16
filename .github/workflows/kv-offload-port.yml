@@ -1,0 +1,67 @@
+name: Metal KV Offload Port
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [perf/revive-metal-kv-offload]
+    paths:
+      - vllm_metal/v1/kv_offload/**
+      - tests/kv_offload_helpers.py
+      - tests/test_kv_offload_*.py
+      - tests/test_memory_guard.py
+      - .github/workflows/kv-offload-port.yml
+
+permissions:
+  contents: read
+
+jobs:
+  port:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      GLOO_SOCKET_IFNAME: lo0
+      VLLM_ENABLE_V1_MULTIPROCESSING: "0"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install current runtime contracts
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip uv
+          python -m pip install \
+            'https://github.com/vllm-project/vllm/releases/download/v0.27.1/vllm-0.27.1%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl'
+          python -m pip install -e '.[dev]'
+      - name: Compile restored modules
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          python -m py_compile vllm_metal/v1/kv_offload/*.py
+          python - <<'PY'
+          from vllm_metal.v1.kv_offload.connector import MetalOffloadingConnector
+          from vllm_metal.v1.kv_offload.spec import (
+              MetalOffloadingSpec,
+              MetalTieringOffloadingSpec,
+          )
+          print(MetalOffloadingConnector)
+          print(MetalOffloadingSpec, MetalTieringOffloadingSpec)
+          PY
+      - name: Run portable focused tests
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          pytest -q \
+            tests/test_kv_offload_config.py \
+            tests/test_kv_offload_cuda_parity.py \
+            tests/test_kv_offload_fs_tier.py \
+            tests/test_kv_offload_tiering.py \
+            tests/test_kv_offload_worker.py \
+            tests/test_memory_guard.py
