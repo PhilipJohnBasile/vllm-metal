@@ -147,6 +147,13 @@ def _register() -> str | None:
 
         apply_deferred_gdn_state_patch()
 
+    if os.getenv("VLLM_METAL_GDN_PREALLOCATE_CHECKPOINTS", "0") == "1":
+        from vllm_metal.experimental.gdn_preallocate_probe import (
+            apply_gdn_preallocation_probe,
+        )
+
+        apply_gdn_preallocation_probe()
+
     from vllm_metal.platform import MetalPlatform
 
     if MetalPlatform.is_available():
