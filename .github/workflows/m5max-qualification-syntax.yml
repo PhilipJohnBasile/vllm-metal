@@ -1,0 +1,27 @@
+name: M5 Max Qualification Syntax
+
+on:
+  push:
+    branches: [perf/m5max-qualification-harness]
+    paths:
+      - tools/benchmark/m5max_context_qualification.py
+      - tools/benchmark/m5max_small_m_quantized.py
+      - .github/workflows/m5max-context-qualification.yml
+      - .github/workflows/m5max-qualification-syntax.yml
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: |
+          python -m py_compile \
+            tools/benchmark/m5max_context_qualification.py \
+            tools/benchmark/m5max_small_m_quantized.py
