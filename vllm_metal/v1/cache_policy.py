@@ -337,11 +337,20 @@ class ModelCachePolicy:
                 "method='mtp' was configured but the loaded Qwen checkpoint "
                 "does not contain native MTP weights"
             )
-        mtp = getattr(model, "mtp", None)
-        args = getattr(model, "args", None)
+        # Qwen3.5's multimodal-compatible MLX wrapper exposes the text model
+        # as ``language_model`` while delegating supports_mtp/mtp_forward at the
+        # top level. Cache ownership needs the text model itself because that is
+        # where the trained MTP module and TextModelArgs live. Dense/text-only
+        # models without the wrapper continue to use the object directly.
+        mtp_model = getattr(model, "language_model", model)
+        mtp = getattr(mtp_model, "mtp", None)
+        args = getattr(mtp_model, "args", None)
         layers = list(getattr(mtp, "layers", ()))
         if mtp is None or args is None or not layers:
-            raise ValueError("native Qwen MTP requires model.mtp.layers and model.args")
+            raise ValueError(
+                "native Qwen MTP requires the loaded text model to expose "
+                "mtp.layers and args"
+            )
         try:
             num_kv_heads = int(args.num_key_value_heads)
             head_dim = int(args.head_dim)
@@ -350,7 +359,7 @@ class ModelCachePolicy:
             raise ValueError(
                 "native Qwen MTP model metadata is missing KV/head dimensions"
             ) from exc
-        return model, len(layers), num_kv_heads, head_dim, hidden_size
+        return mtp_model, len(layers), num_kv_heads, head_dim, hidden_size
 
     def qwen_mtp_aux_bytes_per_block(self) -> int:
         metadata = self._qwen_mtp_metadata()
