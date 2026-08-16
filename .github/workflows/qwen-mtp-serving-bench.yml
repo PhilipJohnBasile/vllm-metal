@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   benchmark:
-    runs-on: macos-15-arm64
+    runs-on: macos-15
     timeout-minutes: 60
     env:
       VLLM_METAL_USE_PAGED_ATTENTION: "1"
