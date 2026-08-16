@@ -15,7 +15,7 @@ polymorphic here.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import mlx.core as mx
 from vllm.v1.outputs import DraftTokenIds
@@ -159,15 +159,21 @@ class Gemma4MTPProposer:
 
 @dataclass(slots=True)
 class _QwenMTPRequestState:
-    cache: list[Any]
-    pending_hidden: mx.array | None = None
+    pending_hidden: mx.array | None
+    next_mtp_position: int
 
 
 class QwenNativeMTPProposer:
-    """One-token native Qwen MTP proposer using the mlx-lm model protocol.
+    """One-token native Qwen MTP proposer backed by scheduler-owned KV.
 
-    State is request-local in this phase. Scheduler prefix hits are refused
-    until MTP-head KV is represented in scheduler-owned blocks.
+    The target hybrid runtime owns both the MTP-head paged KV and a target
+    boundary-hidden shadow. A new request may therefore adopt a scheduler
+    prefix hit without creating a fresh request-local MTP cache.
+
+    vLLM's EAGLE cache group drops one hash unit from a warm hit, so the target
+    recomputes a non-empty suffix. The retained MTP cache is valid through the
+    recompute boundary; drafting resumes *at* ``prefill.start_pos`` rather than
+    overwriting the retained shared tail at ``start_pos - 1``.
     """
 
     def __init__(self, runner: MetalModelRunner) -> None:
@@ -186,13 +192,8 @@ class QwenNativeMTPProposer:
             raise ValueError(
                 "method='mtp' requires native MTP weights and supports_mtp=True"
             )
-        if not callable(getattr(model, "mtp_forward", None)) or not callable(
-            getattr(model, "make_mtp_cache", None)
-        ):
-            raise ValueError(
-                "native MTP model must expose mtp_forward() and make_mtp_cache()"
-            )
-        self._model = model
+        if not callable(getattr(model, "mtp_forward", None)):
+            raise ValueError("native MTP model must expose mtp_forward()")
         self._states: dict[str, _QwenMTPRequestState] = {}
         self._prefix_hit_blocked: set[str] = set()
 
@@ -203,6 +204,8 @@ class QwenNativeMTPProposer:
         has_final_prefill: bool,
     ) -> bool:
         del decode_segments, has_final_prefill
+        # Intermediate chunks populate both the MTP KV and the reusable
+        # boundary-hidden shadow, so every Qwen MTP target forward retains them.
         return True
 
     def release_requests(self, req_ids: set[str]) -> None:
@@ -210,38 +213,73 @@ class QwenNativeMTPProposer:
             self._states.pop(req_id, None)
             self._prefix_hit_blocked.discard(req_id)
 
-    def _new_state(self) -> _QwenMTPRequestState:
-        cache = list(self._model.make_mtp_cache())
-        if not cache:
-            raise RuntimeError("native Qwen MTP model returned an empty MTP cache")
-        return _QwenMTPRequestState(cache=cache)
+    def _runtime(self):
+        runtime = self._runner._paged_attention_runtime
+        if runtime is None or not bool(getattr(runtime, "qwen_mtp_ready", False)):
+            raise RuntimeError(
+                "native Qwen MTP requires the scheduler-owned paged MTP runtime"
+            )
+        return runtime
+
+    def _new_state(self, prefill) -> _QwenMTPRequestState | None:
+        if prefill.start_pos == 0:
+            return _QwenMTPRequestState(
+                pending_hidden=None,
+                next_mtp_position=0,
+            )
+        try:
+            # Validate that the target prefix's durable boundary metadata exists
+            # in the same scheduler-owned block lineage. EAGLE has already
+            # dropped one hash unit, so the MTP KV itself resumes at start_pos.
+            self._runtime().qwen_mtp_boundary_hidden(
+                prefill.block_ids,
+                prefill.start_pos - 1,
+            )
+        except RuntimeError:
+            # Correctness-preserving fallback: target generation continues but
+            # this request drafts nothing. Never combine the restored target
+            # prefix with a fresh or incomplete MTP cache.
+            self._prefix_hit_blocked.add(prefill.req_id)
+            return None
+        return _QwenMTPRequestState(
+            pending_hidden=None,
+            next_mtp_position=prefill.start_pos,
+        )
 
     def _run_pairs(
         self,
         state: _QwenMTPRequestState,
         hidden_rows: mx.array,
         next_token_ids: Sequence[int],
+        block_ids_by_group: Sequence[Sequence[int]],
+        *,
+        start_pos: int,
     ) -> int:
         if hidden_rows.shape[0] != len(next_token_ids):
             raise RuntimeError(
                 "Qwen MTP hidden/token pair count mismatch: "
                 f"{hidden_rows.shape[0]} != {len(next_token_ids)}"
             )
-        if not next_token_ids:
-            raise RuntimeError("Qwen MTP forward requires at least one pair")
-        logits = self._model.mtp_forward(
-            hidden_rows[None],
-            mx.array([list(next_token_ids)], dtype=mx.uint32),
-            state.cache,
+        if state.next_mtp_position != start_pos:
+            raise RuntimeError(
+                "Qwen MTP logical position mismatch: "
+                f"cache expects {state.next_mtp_position}, caller supplied {start_pos}"
+            )
+        draft = self._runtime().qwen_mtp_run_pairs(
+            hidden_rows=hidden_rows,
+            next_token_ids=next_token_ids,
+            block_ids_by_group=block_ids_by_group,
+            start_pos=start_pos,
         )
-        mx.eval(logits)
-        return int(mx.argmax(logits[0, -1], axis=-1).item())
+        state.next_mtp_position += len(next_token_ids)
+        return draft
 
     def _advance_prefill(
         self,
         state: _QwenMTPRequestState,
         hidden_rows: mx.array,
         input_token_ids: Sequence[int],
+        block_ids_by_group: Sequence[Sequence[int]],
     ) -> None:
         if hidden_rows.shape[0] != len(input_token_ids):
             raise RuntimeError("Qwen MTP prefill hidden/token length mismatch")
@@ -260,6 +298,8 @@ class QwenNativeMTPProposer:
                 state,
                 mx.concatenate(pair_hidden, axis=0),
                 pair_tokens,
+                block_ids_by_group,
+                start_pos=state.next_mtp_position,
             )
         state.pending_hidden = hidden_rows[-1:]
 
@@ -267,6 +307,7 @@ class QwenNativeMTPProposer:
         self,
         state: _QwenMTPRequestState,
         sampled_token_id: int,
+        block_ids_by_group: Sequence[Sequence[int]],
     ) -> int:
         if state.pending_hidden is None:
             raise RuntimeError("Qwen MTP final prefill has no boundary hidden state")
@@ -274,6 +315,8 @@ class QwenNativeMTPProposer:
             state,
             state.pending_hidden,
             [sampled_token_id],
+            block_ids_by_group,
+            start_pos=state.next_mtp_position,
         )
         state.pending_hidden = None
         return draft
@@ -307,9 +350,20 @@ class QwenNativeMTPProposer:
             request_state = self._states.get(req_id)
             if request_state is None or req_id in self._prefix_hit_blocked:
                 continue
+            if request_state.next_mtp_position != segment.cache_start_pos:
+                raise RuntimeError(
+                    f"Qwen MTP request {req_id!r} expected target position "
+                    f"{request_state.next_mtp_position}, got {segment.cache_start_pos}"
+                )
             count = len(sampled_ids)
             hidden_rows = hidden[segment.start_row : segment.start_row + count]
-            draft = self._run_pairs(request_state, hidden_rows, sampled_ids)
+            draft = self._run_pairs(
+                request_state,
+                hidden_rows,
+                sampled_ids,
+                segment.block_ids,
+                start_pos=segment.cache_start_pos,
+            )
             draft_req_ids.append(req_id)
             drafts.append([draft])
 
@@ -324,13 +378,21 @@ class QwenNativeMTPProposer:
             req_id = prefill.req_id
             request_state = self._states.get(req_id)
             if request_state is None:
-                if prefill.start_pos > 0:
-                    self._prefix_hit_blocked.add(req_id)
+                request_state = self._new_state(prefill)
+                if request_state is None:
                     continue
-                request_state = self._new_state()
                 self._states[req_id] = request_state
             if req_id in self._prefix_hit_blocked:
                 continue
+
+            expected_position = prefill.start_pos - int(
+                request_state.pending_hidden is not None
+            )
+            if request_state.next_mtp_position != expected_position:
+                raise RuntimeError(
+                    f"Qwen MTP prefill {req_id!r} expected MTP position "
+                    f"{expected_position}, found {request_state.next_mtp_position}"
+                )
 
             start = ctx.cu_seqlens[ctx.num_decode_segments + index]
             end = ctx.cu_seqlens[ctx.num_decode_segments + index + 1]
@@ -338,6 +400,7 @@ class QwenNativeMTPProposer:
                 request_state,
                 hidden[start:end],
                 prefill.token_ids,
+                prefill.block_ids,
             )
             if result_mode == "intermediate":
                 continue
@@ -352,6 +415,7 @@ class QwenNativeMTPProposer:
             draft = self._draft_after_prefill_sample(
                 request_state,
                 int(sampled_token_id),
+                prefill.block_ids,
             )
             draft_req_ids.append(req_id)
             drafts.append([draft])

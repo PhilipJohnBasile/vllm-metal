@@ -11,29 +11,14 @@ from vllm_metal.v1.model_adapter import DefaultModelAdapter
 from vllm_metal.v1.proposer import ProposeContext, QwenNativeMTPProposer
 from vllm_metal.v1.spec_decode import PagedDecodeSegment
 
-VOCAB = 32
-
-
-class _FakeMTPCache:
-    def __init__(self) -> None:
-        self.seen: list[int] = []
+VOCAB = 64
 
 
 class _FakeNativeMTPModel:
     supports_mtp = True
 
-    def __init__(self) -> None:
-        self.created: list[_FakeMTPCache] = []
-
-    def make_mtp_cache(self):
-        cache = _FakeMTPCache()
-        self.created.append(cache)
-        return [cache]
-
     def mtp_forward(self, hidden, next_token_ids, cache):
-        del hidden
-        tokens = [int(token) for token in next_token_ids[0].tolist()]
-        cache[0].seen.extend(tokens)
+        del hidden, cache
         predicted = (next_token_ids.astype(mx.int32) + 1) % VOCAB
         return mx.eye(VOCAB, dtype=mx.float32)[predicted] * 100.0
 
@@ -47,6 +32,46 @@ class _FakeNativeMTPModel:
         return logits
 
 
+class _FakePagedRuntime:
+    qwen_mtp_ready = True
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.boundaries: dict[int, mx.array] = {}
+        self.boundary_reads: list[int] = []
+        self.fail_boundary = False
+
+    def supports_hybrid_speculative_decode(self) -> bool:
+        return True
+
+    def qwen_mtp_boundary_hidden(self, block_ids_by_group, token_position):
+        assert len(block_ids_by_group) == 2
+        self.boundary_reads.append(token_position)
+        if self.fail_boundary or token_position not in self.boundaries:
+            raise RuntimeError("missing boundary")
+        return self.boundaries[token_position]
+
+    def qwen_mtp_run_pairs(
+        self,
+        *,
+        hidden_rows,
+        next_token_ids,
+        block_ids_by_group,
+        start_pos,
+    ):
+        assert len(block_ids_by_group) == 2
+        tokens = [int(token) for token in next_token_ids]
+        self.calls.append(
+            {
+                "start_pos": start_pos,
+                "tokens": tokens,
+                "hidden": [float(row[0].item()) for row in hidden_rows],
+                "mtp_blocks": list(block_ids_by_group[1]),
+            }
+        )
+        return (tokens[-1] + 1) % VOCAB
+
+
 class _Controller:
     @staticmethod
     def can_draft_greedy(req_id, state):
@@ -54,10 +79,10 @@ class _Controller:
         return True
 
 
-def _runner(model=None, width=1):
-    model = model or _FakeNativeMTPModel()
+def _runner(model=None, width=1, runtime=None):
     return SimpleNamespace(
-        _forward_model=model,
+        _forward_model=model or _FakeNativeMTPModel(),
+        _paged_attention_runtime=runtime or _FakePagedRuntime(),
         vllm_config=SimpleNamespace(
             speculative_config=SimpleNamespace(
                 method="mtp",
@@ -102,6 +127,15 @@ def _hidden(*token_ids):
     return mx.repeat(values[:, None], 4, axis=-1)
 
 
+def _prefill(req_id, token_ids, start_pos):
+    return SimpleNamespace(
+        req_id=req_id,
+        token_ids=list(token_ids),
+        start_pos=start_pos,
+        block_ids=[[2, 3, 4, 5], [20, 21, 22, 23]],
+    )
+
+
 class TestQwenTargetHiddenContract:
     def test_adapter_uses_model_logits_and_pre_norm_hidden(self) -> None:
         model = _FakeNativeMTPModel()
@@ -116,7 +150,7 @@ class TestQwenTargetHiddenContract:
         assert output.hidden_states[0, 0].item() == 2.0
 
 
-class TestQwenNativeMTPProposer:
+class TestQwenNativeMTPProposerPagedTransaction:
     def test_requires_the_trained_one_token_width(self) -> None:
         with pytest.raises(ValueError, match="exactly one speculative token"):
             QwenNativeMTPProposer(_runner(width=3))
@@ -125,17 +159,16 @@ class TestQwenNativeMTPProposer:
         proposer = QwenNativeMTPProposer(_runner())
         assert proposer.needs_target_hidden_states([], has_final_prefill=False)
 
-    def test_chunked_prefill_decode_and_release_are_transactional(self) -> None:
-        model = _FakeNativeMTPModel()
-        proposer = QwenNativeMTPProposer(_runner(model=model))
+    def test_chunked_prefill_decode_and_release_use_scheduler_positions(self) -> None:
+        runtime = _FakePagedRuntime()
+        proposer = QwenNativeMTPProposer(_runner(runtime=runtime))
         sampling = SamplingParams(temperature=0)
         state = SimpleNamespace(sampling_params=sampling)
 
-        intermediate = SimpleNamespace(req_id="r0", token_ids=[1, 2, 3], start_pos=0)
         result = proposer.propose(
             _ctx(
                 hidden=_hidden(1, 2, 3),
-                prefill_reqs=[intermediate],
+                prefill_reqs=[_prefill("r0", [1, 2, 3], 0)],
                 prefill_token_ids=[0],
                 prefill_result_modes=["intermediate"],
                 request_states={"r0": state},
@@ -143,13 +176,13 @@ class TestQwenNativeMTPProposer:
             )
         )
         assert result is None
-        assert model.created[0].seen == [2, 3]
+        assert runtime.calls[-1]["start_pos"] == 0
+        assert runtime.calls[-1]["tokens"] == [2, 3]
 
-        final = SimpleNamespace(req_id="r0", token_ids=[4, 5], start_pos=3)
         result = proposer.propose(
             _ctx(
                 hidden=_hidden(4, 5),
-                prefill_reqs=[final],
+                prefill_reqs=[_prefill("r0", [4, 5], 3)],
                 prefill_token_ids=[6],
                 prefill_result_modes=["new_final"],
                 request_states={"r0": state},
@@ -157,9 +190,11 @@ class TestQwenNativeMTPProposer:
             )
         )
         assert result is not None
-        assert result.req_ids == ["r0"]
         assert result.draft_token_ids == [[7]]
-        assert model.created[0].seen == [2, 3, 4, 5, 6]
+        assert [(c["start_pos"], c["tokens"]) for c in runtime.calls[-2:]] == [
+            (2, [4, 5]),
+            (4, [6]),
+        ]
 
         segment = PagedDecodeSegment(
             req_id="r0",
@@ -168,7 +203,7 @@ class TestQwenNativeMTPProposer:
             num_query_tokens=2,
             draft_token_ids=(7,),
             cache_start_pos=5,
-            block_ids=((2, 3),),
+            block_ids=((2, 3, 4, 5), (20, 21, 22, 23)),
         )
         result = proposer.propose(
             _ctx(
@@ -182,26 +217,56 @@ class TestQwenNativeMTPProposer:
         )
         assert result is not None
         assert result.draft_token_ids == [[9]]
-        assert model.created[0].seen == [2, 3, 4, 5, 6, 7, 8]
+        assert runtime.calls[-1]["start_pos"] == 5
+        assert runtime.calls[-1]["tokens"] == [7, 8]
 
         proposer.release_requests({"r0"})
         assert "r0" not in proposer._states
 
-    def test_scheduler_prefix_hit_is_not_adopted_without_mtp_kv(self) -> None:
-        model = _FakeNativeMTPModel()
-        proposer = QwenNativeMTPProposer(_runner(model=model))
+    def test_scheduler_prefix_hit_resumes_after_eagle_recompute_boundary(self) -> None:
+        runtime = _FakePagedRuntime()
+        runtime.boundaries[99] = _hidden(99)
+        proposer = QwenNativeMTPProposer(_runner(runtime=runtime))
         state = SimpleNamespace(sampling_params=SamplingParams(temperature=0))
-        prefix_hit = SimpleNamespace(req_id="hit", token_ids=[20, 21], start_pos=100)
+
         result = proposer.propose(
             _ctx(
-                hidden=_hidden(20, 21),
-                prefill_reqs=[prefix_hit],
-                prefill_token_ids=[22],
+                hidden=_hidden(100, 101),
+                prefill_reqs=[_prefill("hit", [100, 101], 100)],
+                prefill_token_ids=[102],
+                prefill_result_modes=["cached_final"],
+                request_states={"hit": state},
+                cu_seqlens=[0, 2],
+            )
+        )
+        assert result is not None
+        assert result.draft_token_ids == [[39]]  # (102 + 1) % 64
+        assert runtime.boundary_reads == [99]
+        # The retained MTP shared tail is not overwritten at position 99. The
+        # EAGLE-dropped suffix recomputes target hidden 100 first, then MTP
+        # resumes at logical position 100.
+        assert [(c["start_pos"], c["tokens"]) for c in runtime.calls] == [
+            (100, [101]),
+            (101, [102]),
+        ]
+        assert runtime.calls[0]["hidden"] == [100.0]
+        assert "hit" not in proposer._prefix_hit_blocked
+
+    def test_missing_boundary_fails_closed_without_fresh_mtp_state(self) -> None:
+        runtime = _FakePagedRuntime()
+        runtime.fail_boundary = True
+        proposer = QwenNativeMTPProposer(_runner(runtime=runtime))
+        state = SimpleNamespace(sampling_params=SamplingParams(temperature=0))
+        result = proposer.propose(
+            _ctx(
+                hidden=_hidden(100, 101),
+                prefill_reqs=[_prefill("hit", [100, 101], 100)],
+                prefill_token_ids=[102],
                 prefill_result_modes=["cached_final"],
                 request_states={"hit": state},
                 cu_seqlens=[0, 2],
             )
         )
         assert result is None
-        assert not model.created
+        assert runtime.calls == []
         assert "hit" in proposer._prefix_hit_blocked

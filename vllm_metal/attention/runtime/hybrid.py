@@ -35,6 +35,7 @@ from vllm_metal.attention.impls.sdpa_wrapper import (
 from vllm_metal.attention.patching import walk_and_wrap
 from vllm_metal.attention.runtime.base import PagedAttentionRuntimeBase
 from vllm_metal.attention.state import AlignGDNStateManager, HybridGDNStateManager
+from vllm_metal.v1.qwen_mtp_paged import QwenMTPPagedState
 
 logger = init_logger(__name__)
 
@@ -100,6 +101,8 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         mamba_cache_mode: str = "none",
         # One scheduler-owned GDN snapshot block per possible draft token.
         num_speculative_blocks: int = 0,
+        # Optional native-Qwen MTP cache transaction.
+        qwen_mtp_state: QwenMTPPagedState | None = None,
         # TurboQuant (SDPA layers only)
         turboquant: bool = False,
         k_quant: str | None = None,
@@ -117,6 +120,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         if num_speculative_blocks < 0:
             raise ValueError("num_speculative_blocks must be non-negative")
         self._num_speculative_blocks = num_speculative_blocks
+        self._qwen_mtp_state = qwen_mtp_state
 
         # SDPA params
         self._num_kv_heads = num_kv_heads
@@ -196,6 +200,11 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             if align
             else HybridGDNStateManager(self._state_cache)
         )
+        if self._qwen_mtp_state is not None:
+            self._qwen_mtp_state.initialize(
+                num_blocks=num_blocks,
+                block_size=self._block_size,
+            )
 
         logger.info(
             "Hybrid cache initialized: %d SDPA layers (%d blocks), "
@@ -216,6 +225,8 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         state_group_indices: tuple[int, ...] = (),
         layer_group_ordinals: list[int] | None = None,
         layer_pool_ordinals: list[int] | None = None,
+        mtp_group_index: int | None = None,
+        mtp_block_size: int | None = None,
     ) -> None:
         """Select the vLLM scheduler groups backing this runtime.
 
@@ -234,8 +245,22 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
                 "hybrid paged attention requires the SDPA scheduler group "
                 f"block size to stay {self._block_size}, got {block_size}"
             )
-        self._scheduler_group_indices = (group_index,)
-        self._group_block_sizes = (block_size,)
+        if self._qwen_mtp_state is not None:
+            if mtp_group_index is None or mtp_block_size is None:
+                raise RuntimeError(
+                    "native Qwen MTP runtime is missing its scheduler cache group"
+                )
+            self._qwen_mtp_state.configure_groups(
+                target_group_index=group_index,
+                mtp_group_index=mtp_group_index,
+                target_block_size=block_size,
+                mtp_block_size=mtp_block_size,
+            )
+            self._scheduler_group_indices = (group_index, mtp_group_index)
+            self._group_block_sizes = (block_size, mtp_block_size)
+        else:
+            self._scheduler_group_indices = (group_index,)
+            self._group_block_sizes = (block_size,)
         self._state_group_indices = tuple(state_group_indices)
         if layer_group_ordinals is not None:
             pool_ordinals = (
@@ -322,6 +347,8 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self.kv_cache.copy_blocks(block_copies)
         if self._mamba_cache_mode == "align":
             self.state_cache.copy_blocks(block_copies)
+        if self._qwen_mtp_state is not None:
+            self._qwen_mtp_state.copy_blocks(block_copies)
 
     def populate_step_context(
         self,
@@ -357,8 +384,55 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             num_sampled_tokens=num_sampled_tokens,
         )
 
+    @property
+    def qwen_mtp_ready(self) -> bool:
+        return self._qwen_mtp_state is not None and self._qwen_mtp_state.ready
+
+    def supports_hybrid_speculative_decode(self) -> bool:
+        return self._mamba_cache_mode == "align" and self.qwen_mtp_ready
+
+    def store_qwen_mtp_target_hidden(
+        self,
+        ctx: PagedAttentionContext,
+        hidden_states: mx.array,
+    ) -> None:
+        if self._qwen_mtp_state is None:
+            return
+        self._qwen_mtp_state.store_target_hidden(ctx, hidden_states)
+
+    def qwen_mtp_boundary_hidden(
+        self,
+        block_ids_by_group: Sequence[Sequence[int]],
+        token_position: int,
+    ) -> mx.array:
+        if self._qwen_mtp_state is None:
+            raise RuntimeError("Qwen MTP boundary state is not installed")
+        return self._qwen_mtp_state.read_boundary_hidden(
+            block_ids_by_group,
+            token_position,
+        )
+
+    def qwen_mtp_run_pairs(
+        self,
+        *,
+        hidden_rows: mx.array,
+        next_token_ids: Sequence[int],
+        block_ids_by_group: Sequence[Sequence[int]],
+        start_pos: int,
+    ) -> int:
+        if self._qwen_mtp_state is None:
+            raise RuntimeError("Qwen MTP paged state is not installed")
+        return self._qwen_mtp_state.run_pairs(
+            hidden_rows=hidden_rows,
+            next_token_ids=next_token_ids,
+            block_ids_by_group=block_ids_by_group,
+            start_pos=start_pos,
+        )
+
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
         self.gdn_state_manager.extend_forward_eval_outputs(outputs)
+        if self._qwen_mtp_state is not None:
+            self._qwen_mtp_state.extend_forward_eval_outputs(outputs)
 
     def release_requests(self, req_ids: set[str]) -> None:
         self.gdn_state_manager.release_requests(req_ids)

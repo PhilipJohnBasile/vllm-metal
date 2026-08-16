@@ -470,6 +470,16 @@ class MetalModelRunner:
         max_head_dim = (
             max(head_dims) if head_dims else self.model_config.get_head_size()
         )
+        runtime = self._paged_attention_runtime
+        if (
+            self.is_hybrid
+            and runtime is not None
+            and callable(getattr(runtime, "supports_hybrid_speculative_decode", None))
+            and runtime.supports_hybrid_speculative_decode()
+        ):
+            # The phase-2 GDN wrapper requires one segment per request so it
+            # can emit a recurrent/conv checkpoint after every verify token.
+            return True
         return (
             envs.VLLM_METAL_SPEC_VERIFY_WINDOW
             and not self.is_mla
@@ -748,6 +758,10 @@ class MetalModelRunner:
             Block size in bytes
         """
         return self._cache_policy.get_cache_block_size_bytes()
+
+    def qwen_mtp_aux_bytes_per_block(self) -> int:
+        """Return native-Qwen MTP KV and boundary-hidden bytes per block."""
+        return self._cache_policy.qwen_mtp_aux_bytes_per_block()
 
     def linear_cache_bytes_per_slot(self) -> int:
         """Bytes for one request's linear attention state across all GDN layers."""
@@ -1345,6 +1359,14 @@ class MetalModelRunner:
                     logits = target_output.logits
                     target_hidden_states = target_output.hidden_states
                     del target_output
+
+            if (
+                ctx is not None
+                and runtime is not None
+                and target_hidden_states is not None
+                and bool(getattr(runtime, "qwen_mtp_ready", False))
+            ):
+                runtime.store_qwen_mtp_target_hidden(ctx, target_hidden_states)
         finally:
             clear_context()
 
@@ -1936,6 +1958,17 @@ class MetalModelRunner:
             is_hybrid=self.is_hybrid,
             use_async_scheduling=self.use_async_scheduling,
             speculative_config=self.vllm_config.speculative_config,
+            hybrid_speculative_ready=(
+                self._paged_attention_runtime is not None
+                and callable(
+                    getattr(
+                        self._paged_attention_runtime,
+                        "supports_hybrid_speculative_decode",
+                        None,
+                    )
+                )
+                and self._paged_attention_runtime.supports_hybrid_speculative_decode()
+            ),
         )
 
     def _run_vision_encoders(
