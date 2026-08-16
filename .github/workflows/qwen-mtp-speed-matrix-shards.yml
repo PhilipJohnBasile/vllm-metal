@@ -1,0 +1,294 @@
+name: Qwen MTP Speed Matrix Shards
+
+on:
+  workflow_dispatch:
+    inputs:
+      repeats:
+        description: Timed repetitions per workload
+        required: true
+        default: "2"
+        type: choice
+        options:
+          - "2"
+          - "3"
+          - "5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qwen-mtp-speed-shards-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  speed-matrix-shard:
+    name: shard-${{ matrix.shard }}
+    runs-on: macos-15
+    timeout-minutes: 240
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: a
+            profiles: baseline_ref,mtp_safe,mtp_batch1024,baseline_repeat
+          - shard: b
+            profiles: baseline_ref,mtp_batch2048,mtp_batch4096,baseline_repeat
+          - shard: c
+            profiles: baseline_ref,mtp_block32,mtp_verify_window,baseline_repeat
+          - shard: d
+            profiles: baseline_ref,mtp_no_decode_pipeline,mtp_gdn_fallback,baseline_repeat
+    env:
+      VLLM_METAL_USE_PAGED_ATTENTION: "1"
+      VLLM_METAL_MEMORY_FRACTION: auto
+      GLOO_SOCKET_IFNAME: lo0
+      MODEL_DIR: /Users/runner/.cache/vllm-metal-bench/Qwen3.5-0.8B-4bit-mtp
+      MLX_LM_MTP_SHA: ac6aaffd8fdfb8c8e713e17f155d83e3d72b0a0f
+      MATRIX_DIR: /tmp/qwen-mtp-matrix-${{ matrix.shard }}
+      QWEN_MTP_PROFILE_NAMES: ${{ matrix.profiles }}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Cache converted benchmark model
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MODEL_DIR }}
+          key: qwen35-08b-4bit-mtp-${{ runner.os }}-${{ runner.arch }}-${{ env.MLX_LM_MTP_SHA }}
+
+      - name: Install vLLM Metal and exact mlx-lm MTP head
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip uv
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install \
+            'https://github.com/vllm-project/vllm/releases/download/v0.27.1/vllm-0.27.1%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl'
+          VLLM_METAL_BUILD_FROM_SOURCE=1 python -m pip install -e '.[dev]'
+          python -m pip install --force-reinstall --no-deps \
+            "git+https://github.com/PhilipJohnBasile/mlx-lm@${MLX_LM_MTP_SHA}"
+          source scripts/lib.sh
+          ensure_metal_toolchain
+          build_native_artifacts
+
+      - name: Convert Qwen3.5-0.8B with MTP weights
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          rm -rf "$MODEL_DIR"
+          mkdir -p "$(dirname "$MODEL_DIR")"
+          python -m mlx_lm.convert \
+            --hf-path Qwen/Qwen3.5-0.8B \
+            --mlx-path "$MODEL_DIR" \
+            -q --q-bits 4 --q-group-size 64
+
+      - name: Record shard metadata
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$MATRIX_DIR"
+          {
+            echo "git_sha=${GITHUB_SHA}"
+            echo "mlx_lm_mtp_sha=${MLX_LM_MTP_SHA}"
+            echo "shard=${{ matrix.shard }}"
+            echo "profiles=${QWEN_MTP_PROFILE_NAMES}"
+            echo "repeats=${{ inputs.repeats }}"
+            sw_vers
+            uname -a
+            sysctl -n machdep.cpu.brand_string || true
+            system_profiler SPHardwareDataType
+          } | tee "$MATRIX_DIR/runner.txt"
+
+      - name: Run Qwen MTP speed shard
+        id: matrix
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          python benchmarks/qwen_mtp_speed_matrix_shard.py \
+            --model-dir "$MODEL_DIR" \
+            --output-dir "$MATRIX_DIR" \
+            --repeats "${{ inputs.repeats }}" \
+            --request-timeout-s 240 \
+            --server-ready-timeout-s 720 \
+            2>&1 | tee "$MATRIX_DIR/run.log"
+
+      - name: Publish shard summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$MATRIX_DIR/matrix_summary.md" ]; then
+            cat "$MATRIX_DIR/matrix_summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '# Qwen MTP shard %s\n\nNo final report was produced.\n' \
+              '${{ matrix.shard }}' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload shard result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-mtp-speed-matrix-${{ matrix.shard }}
+          path: ${{ env.MATRIX_DIR }}
+          if-no-files-found: warn
+
+      - name: Mark incomplete shard
+        if: steps.matrix.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "Shard ${{ matrix.shard }} did not finish a complete MTP profile." >&2
+          exit 1
+
+  aggregate:
+    name: aggregate-shards
+    runs-on: ubuntu-latest
+    if: always()
+    needs: speed-matrix-shard
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Download available shard artifacts
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: qwen-mtp-speed-matrix-*
+          path: /tmp/qwen-mtp-shards
+
+      - name: Build normalized combined ranking
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path('/tmp/qwen-mtp-shards')
+          summaries = []
+          for path in sorted(root.rglob('matrix_summary.json')):
+              try:
+                  data = json.loads(path.read_text())
+              except Exception:
+                  continue
+              summaries.append((path.parent.name, data))
+
+          ranking = []
+          incomplete = []
+          best_by_workload = {}
+          shard_drift = {}
+          errors = []
+          for shard, data in summaries:
+              for item in data.get('ranking', []):
+                  ranking.append({**item, 'shard': shard})
+              for item in data.get('incomplete_profiles', []):
+                  incomplete.append({**item, 'shard': shard})
+              shard_drift[shard] = data.get('thermal_drift', {})
+              errors.extend(
+                  {**error, 'shard': shard} for error in data.get('errors', [])
+              )
+              for workload, item in data.get('best_by_workload', {}).items():
+                  candidate = {**item, 'shard': shard}
+                  current = best_by_workload.get(workload)
+                  if (
+                      current is None
+                      or candidate.get('speedup_vs_baseline', float('-inf'))
+                      > current.get('speedup_vs_baseline', float('-inf'))
+                  ):
+                      best_by_workload[workload] = candidate
+
+          ranking.sort(key=lambda item: item['geomean_speedup'], reverse=True)
+          incomplete.sort(
+              key=lambda item: (
+                  item.get('workloads_completed', 0),
+                  item.get('geomean_speedup', 0.0),
+              ),
+              reverse=True,
+          )
+          combined = {
+              'shards_found': len(summaries),
+              'best_overall_profile': ranking[0] if ranking else None,
+              'ranking': ranking,
+              'incomplete_profiles': incomplete,
+              'best_by_workload': best_by_workload,
+              'thermal_drift_by_shard': shard_drift,
+              'errors': errors,
+          }
+          out = Path('/tmp/qwen-mtp-shards-combined')
+          out.mkdir(parents=True, exist_ok=True)
+          (out / 'combined_summary.json').write_text(
+              json.dumps(combined, indent=2, sort_keys=True) + '\n'
+          )
+
+          lines = [
+              '# Qwen MTP sharded speed matrix',
+              '',
+              f"- Shard reports found: **{len(summaries)}/4**",
+              f"- Recorded case errors: **{len(errors)}**",
+              '',
+              '## Overall normalized ranking',
+              '',
+              '| Rank | Profile | Shard | Geomean vs local baseline | Worst | Best | Workloads |',
+              '|---:|---|:---:|---:|---:|---:|---:|',
+          ]
+          for index, item in enumerate(ranking, 1):
+              lines.append(
+                  f"| {index} | {item['profile']} | {item['shard']} | "
+                  f"{item['geomean_speedup']:.3f}x | "
+                  f"{item['minimum_speedup']:.3f}x | "
+                  f"{item['maximum_speedup']:.3f}x | "
+                  f"{item['workloads_completed']} |"
+              )
+          if not ranking:
+              lines.append('| — | No complete MTP profile | — | — | — | — | — |')
+
+          lines.extend([
+              '',
+              '## Best profile by workload',
+              '',
+              '| Workload | Profile | Shard | Output tok/s | vs local baseline | Acceptance |',
+              '|---|---|:---:|---:|---:|---:|',
+          ])
+          for workload, item in sorted(best_by_workload.items()):
+              acceptance = item.get('mtp_acceptance_rate')
+              acceptance_text = 'n/a' if acceptance is None else f'{acceptance * 100:.1f}%'
+              lines.append(
+                  f"| {workload} | {item['profile']} | {item['shard']} | "
+                  f"{item['output_throughput_tok_s']:.2f} | "
+                  f"{item['speedup_vs_baseline']:.3f}x | {acceptance_text} |"
+              )
+
+          if incomplete:
+              lines.extend(['', '## Incomplete profiles', ''])
+              for item in incomplete:
+                  lines.append(
+                      f"- `{item['profile']}` in `{item['shard']}`: "
+                      f"{item['workloads_completed']} workloads, "
+                      f"partial geomean {item['geomean_speedup']:.3f}x"
+                  )
+          report = '\n'.join(lines) + '\n'
+          (out / 'combined_summary.md').write_text(report)
+          print(report)
+          with Path(__import__('os').environ['GITHUB_STEP_SUMMARY']).open('a') as handle:
+              handle.write(report)
+          PY
+
+      - name: Upload combined ranking
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-mtp-speed-matrix-combined
+          path: /tmp/qwen-mtp-shards-combined
+          if-no-files-found: warn
