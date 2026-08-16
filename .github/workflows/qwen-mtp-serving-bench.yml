@@ -1,40 +1,37 @@
-name: Qwen MTP Serving Benchmark
+name: Qwen MTP Speed Matrix
 
 on:
+  workflow_dispatch:
   push:
-    branches: [pr/610-05-paged-qwen-mtp-prefix]
+    branches:
+      - pr/610-05-paged-qwen-mtp-prefix
     paths:
       - .github/workflows/qwen-mtp-serving-bench.yml
+      - benchmarks/qwen_mtp_speed_matrix.py
       - vllm_metal/v1/proposer.py
       - vllm_metal/v1/qwen_mtp_paged.py
       - vllm_metal/attention/runtime/hybrid.py
       - vllm_metal/attention/impls/linear.py
+      - vllm_metal/envs.py
 
 permissions:
   contents: read
 
 concurrency:
-  group: qwen-mtp-serving-bench-${{ github.ref }}
+  group: qwen-mtp-speed-matrix-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  benchmark:
+  speed-matrix:
     runs-on: macos-15
-    timeout-minutes: 35
+    timeout-minutes: 120
     env:
       VLLM_METAL_USE_PAGED_ATTENTION: "1"
       VLLM_METAL_MEMORY_FRACTION: "auto"
       GLOO_SOCKET_IFNAME: lo0
-      MODEL_DIR: /tmp/Qwen3.5-0.8B-4bit-mtp
-      BENCH_REQUESTS: "12"
-      BENCH_CONCURRENCY: "4"
-      BENCH_OUTPUT_TOKENS: "64"
-      # Hybrid Qwen3.5 resolves to a 544-token scheduler hash unit on this
-      # shape. EAGLE-style MTP deliberately drops one hash unit on a hit, so
-      # we need >2 units to retain one shared unit and still recompute a suffix.
-      BENCH_PROMPT_TOKENS: "1152"
-      BENCH_REQUEST_TIMEOUT_S: "180"
-      SERVER_READY_TIMEOUT_S: "720"
+      MODEL_DIR: /Users/runner/.cache/vllm-metal-bench/Qwen3.5-0.8B-4bit-mtp
+      MLX_LM_MTP_SHA: ac6aaffd8fdfb8c8e713e17f155d83e3d72b0a0f
+      MATRIX_DIR: /tmp/qwen-mtp-matrix
 
     steps:
       - uses: actions/checkout@v5
@@ -45,370 +42,108 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
-      - name: Install and build
+      - name: Cache converted benchmark model
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MODEL_DIR }}
+          key: qwen35-08b-4bit-mtp-${{ runner.os }}-${{ runner.arch }}-${{ env.MLX_LM_MTP_SHA }}
+
+      - name: Install vLLM Metal and exact mlx-lm MTP head
         shell: bash
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip uv
           python -m venv .venv
           source .venv/bin/activate
-          python -m pip install 'https://github.com/vllm-project/vllm/releases/download/v0.27.1/vllm-0.27.1%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl'
+          python -m pip install \
+            'https://github.com/vllm-project/vllm/releases/download/v0.27.1/vllm-0.27.1%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl'
           VLLM_METAL_BUILD_FROM_SOURCE=1 python -m pip install -e '.[dev]'
-          python -m pip install --force-reinstall --no-deps 'git+https://github.com/PhilipJohnBasile/mlx-lm@ac6aaffd8fdfb8c8e713e17f155d83e3d72b0a0f'
+          python -m pip install --force-reinstall --no-deps \
+            "git+https://github.com/PhilipJohnBasile/mlx-lm@${MLX_LM_MTP_SHA}"
           source scripts/lib.sh
           ensure_metal_toolchain
           build_native_artifacts
-          python -c 'import torch; assert torch.backends.mps.is_available(); print("MPS available")'
+          python - <<'PY'
+          import platform
+          import torch
 
-      - name: Convert Qwen3.5-0.8B and verify MTP
+          print("machine:", platform.machine())
+          print("MPS available:", torch.backends.mps.is_available())
+          assert platform.machine() == "arm64"
+          assert torch.backends.mps.is_available()
+          PY
+
+      - name: Convert Qwen3.5-0.8B with MTP weights
+        if: steps.model-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euxo pipefail
           source .venv/bin/activate
           rm -rf "$MODEL_DIR"
-          python -m mlx_lm.convert --hf-path Qwen/Qwen3.5-0.8B --mlx-path "$MODEL_DIR" -q --q-bits 4 --q-group-size 64
-          python - <<'PY'
-          import os
-          from mlx_lm.utils import load
-          model, _ = load(os.environ['MODEL_DIR'])
-          cache = model.make_mtp_cache()
-          print('supports_mtp:', getattr(model, 'supports_mtp', None))
-          print('mtp_cache_entries:', len(cache))
-          assert bool(getattr(model, 'supports_mtp', False))
-          assert cache
-          PY
+          mkdir -p "$(dirname "$MODEL_DIR")"
+          python -m mlx_lm.convert \
+            --hf-path Qwen/Qwen3.5-0.8B \
+            --mlx-path "$MODEL_DIR" \
+            -q \
+            --q-bits 4 \
+            --q-group-size 64
 
-      - name: Cross-check native mlx-lm MTP acceptance
+      - name: Record runner metadata
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$MATRIX_DIR"
+          {
+            echo "git_sha=${GITHUB_SHA}"
+            echo "mlx_lm_mtp_sha=${MLX_LM_MTP_SHA}"
+            sw_vers
+            uname -a
+            sysctl -n machdep.cpu.brand_string || true
+            system_profiler SPHardwareDataType
+          } | tee "$MATRIX_DIR/runner.txt"
+
+      - name: Run baseline and native MTP speed matrix
+        id: matrix
+        continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
           source .venv/bin/activate
-          python - <<'PY'
-          import json
-          import os
-          import time
-          from pathlib import Path
+          python benchmarks/qwen_mtp_speed_matrix.py \
+            --model-dir "$MODEL_DIR" \
+            --output-dir "$MATRIX_DIR" \
+            --repeats 2 \
+            --request-timeout-s 240 \
+            --server-ready-timeout-s 720 \
+            2>&1 | tee "$MATRIX_DIR/run.log"
 
-          import mlx.core as mx
-          from mlx_lm.generate import mtp_generate_step
-          from mlx_lm.utils import load
-
-          model, tokenizer = load(os.environ['MODEL_DIR'])
-          target_prompt_tokens = int(os.environ['BENCH_PROMPT_TOKENS'])
-          seed = (
-              'Apple Silicon speculative decoding uses a shared cached prefix '
-              'and a trained multi-token prediction head. '
-          )
-          text = seed
-          while len(tokenizer.encode(text)) < target_prompt_tokens + 16:
-              text += seed
-          prompt_ids = tokenizer.encode(text)[:target_prompt_tokens]
-          prompt = mx.array(prompt_ids, dtype=mx.uint32)
-
-          max_tokens = 256
-          accepted = 0
-          total = 0
-          started = time.perf_counter()
-          for _token, _logprobs, from_draft in mtp_generate_step(
-              prompt,
-              model,
-              max_tokens=max_tokens,
-          ):
-              total += 1
-              accepted += int(from_draft)
-          elapsed = time.perf_counter() - started
-          attempts = max(0, total - accepted - 1)
-          result = {
-              'output_tokens': total,
-              'accepted_draft_tokens': accepted,
-              'estimated_draft_attempts': attempts,
-              'estimated_acceptance_rate': accepted / attempts if attempts else None,
-              'output_throughput_tok_s': total / elapsed,
-              'elapsed_s': elapsed,
-          }
-          Path('/tmp/native_mtp.json').write_text(json.dumps(result, indent=2) + '\n')
-          print('NATIVE_MTP_RESULT=' + json.dumps(result, sort_keys=True), flush=True)
-          PY
-
-      - name: Create benchmark client
+      - name: Publish matrix summary
+        if: always()
         shell: bash
         run: |
-          cat >/tmp/run_serving_bench.py <<'PY'
-          import argparse
-          import asyncio
-          import json
-          import statistics
-          import time
-          from pathlib import Path
+          if [ -f "$MATRIX_DIR/matrix_summary.md" ]; then
+            cat "$MATRIX_DIR/matrix_summary.md" >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "# Qwen MTP speed matrix" >>"$GITHUB_STEP_SUMMARY"
+            echo "The matrix stopped before producing a report." \
+              >>"$GITHUB_STEP_SUMMARY"
+          fi
 
-          import aiohttp
-          from transformers import AutoTokenizer
-          from vllm.benchmarks.lib.endpoint_request_func import (
-              RequestFuncInput,
-              async_request_openai_completions,
-          )
-          from vllm.benchmarks.serve import fetch_spec_decode_metrics
-
-          async def main():
-              p = argparse.ArgumentParser()
-              for name in ('label', 'model-dir', 'result'):
-                  p.add_argument('--' + name, required=True)
-              for name in (
-                  'requests',
-                  'concurrency',
-                  'prompt-tokens',
-                  'output-tokens',
-                  'port',
-              ):
-                  p.add_argument('--' + name, type=int, required=True)
-              p.add_argument('--request-timeout-s', type=float, required=True)
-              a = p.parse_args()
-              base = f'http://127.0.0.1:{a.port}'
-
-              timeout = aiohttp.ClientTimeout(total=a.request_timeout_s)
-              async with aiohttp.ClientSession(timeout=timeout) as session:
-                  async with session.get(base + '/v1/models') as response:
-                      response.raise_for_status()
-                      model = (await response.json())['data'][0]['id']
-
-                  tokenizer = AutoTokenizer.from_pretrained(
-                      a.model_dir,
-                      trust_remote_code=True,
-                  )
-                  seed = (
-                      'Apple Silicon speculative decoding uses a shared cached prefix '
-                      'and a trained multi-token prediction head. '
-                  )
-                  text = seed
-                  while len(tokenizer.encode(text, add_special_tokens=False)) < a.prompt_tokens + 16:
-                      text += seed
-                  ids = tokenizer.encode(text, add_special_tokens=False)[:a.prompt_tokens]
-                  prompt = tokenizer.decode(ids, skip_special_tokens=False)
-                  prompt_len = len(tokenizer.encode(prompt, add_special_tokens=False))
-                  print(
-                      f'{a.label} prompt_tokens={prompt_len} concurrency={a.concurrency}',
-                      flush=True,
-                  )
-
-                  async def one(tag):
-                      request = RequestFuncInput(
-                          prompt=prompt,
-                          api_url=base + '/v1/completions',
-                          prompt_len=prompt_len,
-                          output_len=a.output_tokens,
-                          model=model,
-                          ignore_eos=True,
-                          extra_body={'temperature': 0},
-                      )
-                      started = time.perf_counter()
-                      try:
-                          output = await asyncio.wait_for(
-                              async_request_openai_completions(request, session),
-                              timeout=a.request_timeout_s,
-                          )
-                      except TimeoutError as exc:
-                          raise RuntimeError(
-                              f'{a.label} request {tag} timed out'
-                          ) from exc
-                      if not output.success:
-                          raise RuntimeError(
-                              f'{a.label} request {tag} failed: {output.error}'
-                          )
-                      print(
-                          f'{a.label} {tag}: out={output.output_tokens} '
-                          f'ttft_ms={output.ttft * 1000:.2f} '
-                          f'e2e_s={time.perf_counter() - started:.2f}',
-                          flush=True,
-                      )
-                      return output
-
-                  await one('warmup')
-                  before = await fetch_spec_decode_metrics(base, session)
-
-                  outputs = []
-                  started = time.perf_counter()
-                  for offset in range(0, a.requests, a.concurrency):
-                      count = min(a.concurrency, a.requests - offset)
-                      wave = await asyncio.gather(
-                          *(
-                              one(f'{offset + index + 1}/{a.requests}')
-                              for index in range(count)
-                          )
-                      )
-                      outputs.extend(wave)
-                  elapsed = time.perf_counter() - started
-                  after = await fetch_spec_decode_metrics(base, session)
-
-                  total_input = sum(x.prompt_len for x in outputs)
-                  total_output = sum(x.output_tokens for x in outputs)
-                  drafts = accepted = 0
-                  if before is not None and after is not None:
-                      drafts = after.num_draft_tokens - before.num_draft_tokens
-                      accepted = after.num_accepted_tokens - before.num_accepted_tokens
-
-                  result = {
-                      'label': a.label,
-                      'requests': a.requests,
-                      'concurrency': a.concurrency,
-                      'prompt_tokens_per_request': prompt_len,
-                      'output_tokens_per_request': a.output_tokens,
-                      'completed_output_tokens': total_output,
-                      'elapsed_s': elapsed,
-                      'output_throughput_tok_s': total_output / elapsed,
-                      'total_token_throughput_tok_s': (
-                          total_input + total_output
-                      ) / elapsed,
-                      'mean_ttft_ms': statistics.mean(
-                          x.ttft * 1000 for x in outputs
-                      ),
-                      'median_ttft_ms': statistics.median(
-                          x.ttft * 1000 for x in outputs
-                      ),
-                      'mean_e2e_ms': statistics.mean(
-                          x.latency * 1000 for x in outputs
-                      ),
-                      'mtp_draft_tokens': drafts,
-                      'mtp_accepted_tokens': accepted,
-                      'mtp_acceptance_rate': accepted / drafts if drafts else None,
-                  }
-                  Path(a.result).write_text(json.dumps(result, indent=2) + '\n')
-                  print(
-                      'BENCHMARK_RESULT=' + json.dumps(result, sort_keys=True),
-                      flush=True,
-                  )
-
-          asyncio.run(main())
-          PY
-
-      - name: Run baseline and MTP serving benchmarks
-        shell: bash
-        run: |
-          set -euxo pipefail
-          source .venv/bin/activate
-          SERVER_PID=""
-          SERVER_LOG=""
-
-          stop_server() {
-            [ -z "${SERVER_PID:-}" ] && return 0
-            if kill -0 "$SERVER_PID" 2>/dev/null; then
-              kill -TERM "$SERVER_PID" 2>/dev/null || true
-              pkill -TERM -P "$SERVER_PID" 2>/dev/null || true
-              for _ in $(seq 1 15); do
-                kill -0 "$SERVER_PID" 2>/dev/null || break
-                sleep 1
-              done
-            fi
-            if kill -0 "$SERVER_PID" 2>/dev/null; then
-              pkill -KILL -P "$SERVER_PID" 2>/dev/null || true
-              kill -KILL "$SERVER_PID" 2>/dev/null || true
-            fi
-            wait "$SERVER_PID" 2>/dev/null || true
-            SERVER_PID=""
-          }
-          trap stop_server EXIT INT TERM
-
-          wait_ready() {
-            local port="$1" start="$SECONDS" deadline=$((SECONDS + SERVER_READY_TIMEOUT_S))
-            while [ "$SECONDS" -lt "$deadline" ]; do
-              if curl --connect-timeout 1 --max-time 1 -fsS "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
-                echo "Server ${port} ready in $((SECONDS-start))s"
-                return 0
-              fi
-              if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-                cat "$SERVER_LOG"
-                return 1
-              fi
-              sleep 2
-            done
-            cat "$SERVER_LOG"
-            return 1
-          }
-
-          run_case() {
-            local label="$1" spec="$2" port="$3"
-            SERVER_LOG="/tmp/server-${label}.log"
-            common=(
-              "$MODEL_DIR"
-              --served-model-name qwen35-mtp-bench
-              --enable-prefix-caching
-              --no-async-scheduling
-              --max-model-len 1280
-              --max-num-batched-tokens 512
-              --block-size 16
-              --enforce-eager
-              --port "$port"
-            )
-            if [ -n "$spec" ]; then
-              vllm serve "${common[@]}" --speculative-config "$spec" >"$SERVER_LOG" 2>&1 &
-            else
-              vllm serve "${common[@]}" >"$SERVER_LOG" 2>&1 &
-            fi
-            SERVER_PID=$!
-            wait_ready "$port"
-
-            set +e
-            python /tmp/run_serving_bench.py \
-              --label "$label" \
-              --model-dir "$MODEL_DIR" \
-              --requests "$BENCH_REQUESTS" \
-              --concurrency "$BENCH_CONCURRENCY" \
-              --prompt-tokens "$BENCH_PROMPT_TOKENS" \
-              --output-tokens "$BENCH_OUTPUT_TOKENS" \
-              --request-timeout-s "$BENCH_REQUEST_TIMEOUT_S" \
-              --port "$port" \
-              --result "/tmp/${label}.json"
-            status=$?
-            set -e
-            stop_server
-            echo "===== ${label} server log tail ====="
-            tail -n 300 "$SERVER_LOG" || true
-            return "$status"
-          }
-
-          run_case baseline '' 8000
-          run_case mtp '{"method":"mtp","num_speculative_tokens":1}' 8001
-
-          python - <<'PY'
-          import json
-          from pathlib import Path
-
-          baseline = json.loads(Path('/tmp/baseline.json').read_text())
-          mtp = json.loads(Path('/tmp/mtp.json').read_text())
-          native = json.loads(Path('/tmp/native_mtp.json').read_text())
-          summary = {
-              'baseline': baseline,
-              'mtp': mtp,
-              'native_mlx_lm_mtp': native,
-              'output_speedup': (
-                  mtp['output_throughput_tok_s']
-                  / baseline['output_throughput_tok_s']
-              ),
-              'total_token_speedup': (
-                  mtp['total_token_throughput_tok_s']
-                  / baseline['total_token_throughput_tok_s']
-              ),
-              'ttft_ratio': mtp['mean_ttft_ms'] / baseline['mean_ttft_ms'],
-          }
-          Path('/tmp/summary.json').write_text(
-              json.dumps(summary, indent=2) + '\n'
-          )
-          print(
-              'FINAL_BENCHMARK_SUMMARY=' + json.dumps(summary, sort_keys=True),
-              flush=True,
-          )
-          PY
-
-      - name: Upload results
+      - name: Upload speed matrix
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: qwen-mtp-serving-benchmark
-          path: |
-            /tmp/native_mtp.json
-            /tmp/baseline.json
-            /tmp/mtp.json
-            /tmp/summary.json
-            /tmp/server-baseline.log
-            /tmp/server-mtp.log
-          if-no-files-found: warn
+          name: qwen-mtp-speed-matrix
+          path: ${{ env.MATRIX_DIR }}
+          if-no-files-found: error
+
+      - name: Fail when no complete MTP profile finished
+        if: steps.matrix.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "The speed matrix did not produce a complete MTP profile." >&2
+          exit 1
