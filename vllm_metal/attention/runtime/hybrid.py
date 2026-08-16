@@ -429,6 +429,25 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             start_pos=start_pos,
         )
 
+    def qwen_mtp_run_pairs_batch(
+        self,
+        *,
+        hidden_rows_batch: Sequence[mx.array],
+        next_token_ids_batch: Sequence[Sequence[int]],
+        block_ids_by_group_batch: Sequence[Sequence[Sequence[int]]],
+        start_positions: Sequence[int],
+        draft_request_indices: Sequence[int] | None = None,
+    ) -> list[int]:
+        if self._qwen_mtp_state is None:
+            raise RuntimeError("Qwen MTP paged state is not installed")
+        return self._qwen_mtp_state.run_pairs_batch(
+            hidden_rows_batch=hidden_rows_batch,
+            next_token_ids_batch=next_token_ids_batch,
+            block_ids_by_group_batch=block_ids_by_group_batch,
+            start_positions=start_positions,
+            draft_request_indices=draft_request_indices,
+        )
+
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
         self.gdn_state_manager.extend_forward_eval_outputs(outputs)
         if self._qwen_mtp_state is not None:

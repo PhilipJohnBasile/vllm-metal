@@ -39,6 +39,7 @@ class _FakePagedRuntime:
         self.calls: list[dict[str, object]] = []
         self.boundaries: dict[int, mx.array] = {}
         self.boundary_reads: list[int] = []
+        self.batch_calls: list[dict[str, object]] = []
         self.fail_boundary = False
 
     def supports_hybrid_speculative_decode(self) -> bool:
@@ -70,6 +71,43 @@ class _FakePagedRuntime:
             }
         )
         return (tokens[-1] + 1) % VOCAB
+
+    def qwen_mtp_run_pairs_batch(
+        self,
+        *,
+        hidden_rows_batch,
+        next_token_ids_batch,
+        block_ids_by_group_batch,
+        start_positions,
+        draft_request_indices=None,
+    ):
+        indices = (
+            list(range(len(hidden_rows_batch)))
+            if draft_request_indices is None
+            else list(draft_request_indices)
+        )
+        self.batch_calls.append(
+            {
+                "requests": len(hidden_rows_batch),
+                "draft_request_indices": indices,
+            }
+        )
+        all_drafts = [
+            self.qwen_mtp_run_pairs(
+                hidden_rows=hidden_rows,
+                next_token_ids=next_token_ids,
+                block_ids_by_group=block_ids_by_group,
+                start_pos=start_pos,
+            )
+            for hidden_rows, next_token_ids, block_ids_by_group, start_pos in zip(
+                hidden_rows_batch,
+                next_token_ids_batch,
+                block_ids_by_group_batch,
+                start_positions,
+                strict=True,
+            )
+        ]
+        return [all_drafts[index] for index in indices]
 
 
 class _Controller:
@@ -270,3 +308,76 @@ class TestQwenNativeMTPProposerPagedTransaction:
         assert result is None
         assert runtime.calls == []
         assert "hit" in proposer._prefix_hit_blocked
+
+    def test_decode_requests_share_one_mtp_runtime_batch(self) -> None:
+        runtime = _FakePagedRuntime()
+        proposer = QwenNativeMTPProposer(_runner(runtime=runtime))
+        state0 = SimpleNamespace(sampling_params=SamplingParams(temperature=0))
+        state1 = SimpleNamespace(sampling_params=SamplingParams(temperature=0))
+
+        proposer.propose(
+            _ctx(
+                hidden=_hidden(1, 2, 11, 12),
+                prefill_reqs=[
+                    _prefill("r0", [1, 2], 0),
+                    _prefill("r1", [11, 12], 0),
+                ],
+                prefill_token_ids=[0, 0],
+                prefill_result_modes=["intermediate", "intermediate"],
+                request_states={"r0": state0, "r1": state1},
+                cu_seqlens=[0, 2, 4],
+            )
+        )
+        assert runtime.batch_calls[-1] == {
+            "requests": 2,
+            "draft_request_indices": [],
+        }
+
+        proposer.propose(
+            _ctx(
+                hidden=_hidden(3, 13),
+                prefill_reqs=[
+                    _prefill("r0", [3], 2),
+                    _prefill("r1", [13], 2),
+                ],
+                prefill_token_ids=[4, 14],
+                prefill_result_modes=["new_final", "new_final"],
+                request_states={"r0": state0, "r1": state1},
+                cu_seqlens=[0, 1, 2],
+            )
+        )
+
+        runtime.batch_calls.clear()
+        result = proposer.propose(
+            _ctx(
+                hidden=_hidden(4, 14),
+                decode_reqs=[("r0", state0), ("r1", state1)],
+                decode_segments=[
+                    PagedDecodeSegment(
+                        req_id="r0",
+                        input_token_ids=(4,),
+                        start_row=0,
+                        num_query_tokens=1,
+                        draft_token_ids=(),
+                        cache_start_pos=3,
+                        block_ids=((2, 3, 4, 5), (20, 21, 22, 23)),
+                    ),
+                    PagedDecodeSegment(
+                        req_id="r1",
+                        input_token_ids=(14,),
+                        start_row=1,
+                        num_query_tokens=1,
+                        draft_token_ids=(),
+                        cache_start_pos=3,
+                        block_ids=((6, 7, 8, 9), (24, 25, 26, 27)),
+                    ),
+                ],
+                decode_token_ids=[[5], [15]],
+                request_states={"r0": state0, "r1": state1},
+                cu_seqlens=[0, 1, 2],
+            )
+        )
+        assert result is not None
+        assert result.req_ids == ["r0", "r1"]
+        assert result.draft_token_ids == [[6], [16]]
+        assert runtime.batch_calls == [{"requests": 2, "draft_request_indices": [0, 1]}]

@@ -313,6 +313,132 @@ class QwenMTPPagedState:
             token_position,
         )
 
+    def _project_mtp_hidden(self, hidden: mx.array) -> mx.array:
+        """Project only MTP rows whose vocabulary logits are consumed."""
+        args = getattr(self.model, "args", None)
+        inner_model = getattr(self.model, "model", None)
+        embed_tokens = getattr(inner_model, "embed_tokens", None)
+        if bool(getattr(args, "tie_word_embeddings", False)):
+            if embed_tokens is None or not callable(
+                getattr(embed_tokens, "as_linear", None)
+            ):
+                raise RuntimeError("Qwen MTP tied output projection is unavailable")
+            return embed_tokens.as_linear(hidden)
+        lm_head = getattr(self.model, "lm_head", None)
+        if lm_head is None:
+            raise RuntimeError("Qwen MTP model has no output projection")
+        return lm_head(hidden)
+
+    def run_pairs_batch(
+        self,
+        *,
+        hidden_rows_batch: Sequence[mx.array],
+        next_token_ids_batch: Sequence[Sequence[int]],
+        block_ids_by_group_batch: Sequence[Sequence[Sequence[int]]],
+        start_positions: Sequence[int],
+        draft_request_indices: Sequence[int] | None = None,
+    ) -> list[int]:
+        """Advance independent MTP cache segments in one packed forward.
+
+        Varlen scheduler metadata keeps requests isolated. Only segment ends
+        that need a speculative token pay the shared vocabulary projection;
+        prefix-maintenance rows update MTP KV without materializing logits.
+        """
+        self._require_ready()
+        num_requests = len(hidden_rows_batch)
+        if not (
+            num_requests
+            == len(next_token_ids_batch)
+            == len(block_ids_by_group_batch)
+            == len(start_positions)
+        ):
+            raise RuntimeError("Qwen MTP batched request metadata length mismatch")
+        if num_requests == 0:
+            return []
+
+        if draft_request_indices is None:
+            draft_indices = list(range(num_requests))
+        else:
+            draft_indices = [int(index) for index in draft_request_indices]
+        if len(set(draft_indices)) != len(draft_indices) or any(
+            index < 0 or index >= num_requests for index in draft_indices
+        ):
+            raise RuntimeError("Qwen MTP draft request index is out of range")
+
+        ordinal = self.mtp_group_ordinal
+        assert self._mtp_block_size is not None
+        prefill_requests: list[tuple[list[int], int, int]] = []
+        hidden_parts: list[mx.array] = []
+        flat_tokens: list[int] = []
+        segment_end_rows: list[int] = []
+        cursor = 0
+
+        for hidden_rows, next_token_ids, block_ids_by_group, start_pos in zip(
+            hidden_rows_batch,
+            next_token_ids_batch,
+            block_ids_by_group_batch,
+            start_positions,
+            strict=True,
+        ):
+            token_ids = [int(token) for token in next_token_ids]
+            if hidden_rows.shape[0] != len(token_ids):
+                raise RuntimeError(
+                    "Qwen MTP hidden/token pair count mismatch: "
+                    f"{hidden_rows.shape[0]} != {len(token_ids)}"
+                )
+            if not token_ids:
+                raise RuntimeError("Qwen MTP forward requires at least one pair")
+            if ordinal >= len(block_ids_by_group):
+                raise RuntimeError("Qwen MTP request is missing its scheduler KV group")
+            mtp_blocks = list(block_ids_by_group[ordinal])
+            last_pos = int(start_pos) + len(token_ids) - 1
+            if last_pos // self._mtp_block_size >= len(mtp_blocks):
+                raise RuntimeError("Qwen MTP scheduler block table is too short")
+
+            prefill_requests.append((mtp_blocks, len(token_ids), int(start_pos)))
+            hidden_parts.append(hidden_rows)
+            flat_tokens.extend(token_ids)
+            cursor += len(token_ids)
+            segment_end_rows.append(cursor - 1)
+
+        prepare_unified(
+            decode_requests=[],
+            prefill_requests=prefill_requests,
+            block_size=self._mtp_block_size,
+        )
+        cache = self._require_mtp_cache()
+        try:
+            packed_hidden = (
+                hidden_parts[0]
+                if len(hidden_parts) == 1
+                else mx.concatenate(hidden_parts, axis=0)
+            )
+            mtp_hidden = self.mtp_module(
+                packed_hidden[None],
+                mx.array([flat_tokens], dtype=mx.uint32),
+                self.model.model.embed_tokens,
+                [None] * self.num_layers,
+            )
+            if draft_indices:
+                end_rows = mx.array(
+                    [segment_end_rows[index] for index in draft_indices],
+                    dtype=mx.int32,
+                )
+                selected_hidden = mtp_hidden[0, end_rows]
+                selected_logits = self._project_mtp_hidden(selected_hidden)
+                draft_ids = mx.argmax(selected_logits, axis=-1)
+                mx.eval(
+                    draft_ids,
+                    *cache.key_caches,
+                    *cache.value_caches,
+                )
+                return [int(token) for token in draft_ids.tolist()]
+
+            mx.eval(*cache.key_caches, *cache.value_caches)
+            return []
+        finally:
+            clear_context()
+
     def run_pairs(
         self,
         *,
@@ -321,39 +447,15 @@ class QwenMTPPagedState:
         block_ids_by_group: Sequence[Sequence[int]],
         start_pos: int,
     ) -> int:
-        self._require_ready()
-        if hidden_rows.shape[0] != len(next_token_ids):
-            raise RuntimeError(
-                "Qwen MTP hidden/token pair count mismatch: "
-                f"{hidden_rows.shape[0]} != {len(next_token_ids)}"
-            )
-        if not next_token_ids:
-            raise RuntimeError("Qwen MTP forward requires at least one pair")
-        ordinal = self.mtp_group_ordinal
-        if ordinal >= len(block_ids_by_group):
-            raise RuntimeError("Qwen MTP request is missing its scheduler KV group")
-        mtp_blocks = list(block_ids_by_group[ordinal])
-        assert self._mtp_block_size is not None
-        last_pos = start_pos + len(next_token_ids) - 1
-        if last_pos // self._mtp_block_size >= len(mtp_blocks):
-            raise RuntimeError("Qwen MTP scheduler block table is too short")
-
-        prepare_unified(
-            decode_requests=[],
-            prefill_requests=[(mtp_blocks, len(next_token_ids), start_pos)],
-            block_size=self._mtp_block_size,
+        drafts = self.run_pairs_batch(
+            hidden_rows_batch=[hidden_rows],
+            next_token_ids_batch=[next_token_ids],
+            block_ids_by_group_batch=[block_ids_by_group],
+            start_positions=[start_pos],
         )
-        cache = self._require_mtp_cache()
-        try:
-            logits = self.model.mtp_forward(
-                hidden_rows[None],
-                mx.array([list(next_token_ids)], dtype=mx.uint32),
-                [None] * self.num_layers,
-            )
-            mx.eval(logits, *cache.key_caches, *cache.value_caches)
-        finally:
-            clear_context()
-        return int(mx.argmax(logits[0, -1], axis=-1).item())
+        if len(drafts) != 1:
+            raise RuntimeError("Qwen MTP single-request draft result is missing")
+        return drafts[0]
 
     def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
         if not self.ready:

@@ -246,6 +246,54 @@ class QwenNativeMTPProposer:
             next_mtp_position=prefill.start_pos,
         )
 
+    def _run_pairs_batch(
+        self,
+        items: Sequence[
+            tuple[
+                _QwenMTPRequestState,
+                mx.array,
+                Sequence[int],
+                Sequence[Sequence[int]],
+                int,
+            ]
+        ],
+        *,
+        draft_request_indices: Sequence[int] | None = None,
+    ) -> list[int]:
+        if not items:
+            return []
+        for state, hidden_rows, next_token_ids, _, start_pos in items:
+            if hidden_rows.shape[0] != len(next_token_ids):
+                raise RuntimeError(
+                    "Qwen MTP hidden/token pair count mismatch: "
+                    f"{hidden_rows.shape[0]} != {len(next_token_ids)}"
+                )
+            if state.next_mtp_position != start_pos:
+                raise RuntimeError(
+                    "Qwen MTP logical position mismatch: "
+                    f"cache expects {state.next_mtp_position}, "
+                    f"caller supplied {start_pos}"
+                )
+
+        drafts = self._runtime().qwen_mtp_run_pairs_batch(
+            hidden_rows_batch=[item[1] for item in items],
+            next_token_ids_batch=[item[2] for item in items],
+            block_ids_by_group_batch=[item[3] for item in items],
+            start_positions=[item[4] for item in items],
+            draft_request_indices=draft_request_indices,
+        )
+        expected_drafts = (
+            len(items) if draft_request_indices is None else len(draft_request_indices)
+        )
+        if len(drafts) != expected_drafts:
+            raise RuntimeError(
+                "Qwen MTP batched draft result count mismatch: "
+                f"{len(drafts)} != {expected_drafts}"
+            )
+        for state, _, next_token_ids, _, _ in items:
+            state.next_mtp_position += len(next_token_ids)
+        return drafts
+
     def _run_pairs(
         self,
         state: _QwenMTPRequestState,
@@ -255,24 +303,18 @@ class QwenNativeMTPProposer:
         *,
         start_pos: int,
     ) -> int:
-        if hidden_rows.shape[0] != len(next_token_ids):
-            raise RuntimeError(
-                "Qwen MTP hidden/token pair count mismatch: "
-                f"{hidden_rows.shape[0]} != {len(next_token_ids)}"
-            )
-        if state.next_mtp_position != start_pos:
-            raise RuntimeError(
-                "Qwen MTP logical position mismatch: "
-                f"cache expects {state.next_mtp_position}, caller supplied {start_pos}"
-            )
-        draft = self._runtime().qwen_mtp_run_pairs(
-            hidden_rows=hidden_rows,
-            next_token_ids=next_token_ids,
-            block_ids_by_group=block_ids_by_group,
-            start_pos=start_pos,
+        drafts = self._run_pairs_batch(
+            [
+                (
+                    state,
+                    hidden_rows,
+                    next_token_ids,
+                    block_ids_by_group,
+                    start_pos,
+                )
+            ]
         )
-        state.next_mtp_position += len(next_token_ids)
-        return draft
+        return drafts[0]
 
     def _advance_prefill(
         self,
@@ -333,6 +375,17 @@ class QwenNativeMTPProposer:
 
         draft_req_ids: list[str] = []
         drafts: list[list[int]] = []
+        first_stage: list[
+            tuple[
+                _QwenMTPRequestState,
+                mx.array,
+                Sequence[int],
+                Sequence[Sequence[int]],
+                int,
+            ]
+        ] = []
+        decode_indices: list[int] = []
+        decode_req_ids: list[str] = []
 
         for (req_id, state), segment, sampled_ids in zip(
             ctx.decode_reqs,
@@ -353,19 +406,27 @@ class QwenNativeMTPProposer:
             if request_state.next_mtp_position != segment.cache_start_pos:
                 raise RuntimeError(
                     f"Qwen MTP request {req_id!r} expected target position "
-                    f"{request_state.next_mtp_position}, got {segment.cache_start_pos}"
+                    f"{request_state.next_mtp_position}, "
+                    f"got {segment.cache_start_pos}"
                 )
             count = len(sampled_ids)
             hidden_rows = hidden[segment.start_row : segment.start_row + count]
-            draft = self._run_pairs(
-                request_state,
-                hidden_rows,
-                sampled_ids,
-                segment.block_ids,
-                start_pos=segment.cache_start_pos,
+            decode_indices.append(len(first_stage))
+            decode_req_ids.append(req_id)
+            first_stage.append(
+                (
+                    request_state,
+                    hidden_rows,
+                    sampled_ids,
+                    segment.block_ids,
+                    segment.cache_start_pos,
+                )
             )
-            draft_req_ids.append(req_id)
-            drafts.append([draft])
+
+        pending_hidden_updates: list[tuple[_QwenMTPRequestState, mx.array]] = []
+        final_prefills: list[
+            tuple[str, _QwenMTPRequestState, int, Sequence[Sequence[int]]]
+        ] = []
 
         for index, (prefill, sampled_token_id, result_mode) in enumerate(
             zip(
@@ -391,17 +452,39 @@ class QwenNativeMTPProposer:
             if request_state.next_mtp_position != expected_position:
                 raise RuntimeError(
                     f"Qwen MTP prefill {req_id!r} expected MTP position "
-                    f"{expected_position}, found {request_state.next_mtp_position}"
+                    f"{expected_position}, found "
+                    f"{request_state.next_mtp_position}"
                 )
 
             start = ctx.cu_seqlens[ctx.num_decode_segments + index]
             end = ctx.cu_seqlens[ctx.num_decode_segments + index + 1]
-            self._advance_prefill(
-                request_state,
-                hidden[start:end],
-                prefill.token_ids,
-                prefill.block_ids,
-            )
+            hidden_rows = hidden[start:end]
+            input_token_ids = prefill.token_ids
+            if hidden_rows.shape[0] != len(input_token_ids):
+                raise RuntimeError("Qwen MTP prefill hidden/token length mismatch")
+            if not input_token_ids:
+                continue
+
+            pair_hidden: list[mx.array] = []
+            pair_tokens: list[int] = []
+            if request_state.pending_hidden is not None:
+                pair_hidden.append(request_state.pending_hidden)
+                pair_tokens.append(int(input_token_ids[0]))
+            if len(input_token_ids) > 1:
+                pair_hidden.append(hidden_rows[:-1])
+                pair_tokens.extend(int(token) for token in input_token_ids[1:])
+            if pair_tokens:
+                first_stage.append(
+                    (
+                        request_state,
+                        mx.concatenate(pair_hidden, axis=0),
+                        pair_tokens,
+                        prefill.block_ids,
+                        request_state.next_mtp_position,
+                    )
+                )
+            pending_hidden_updates.append((request_state, hidden_rows[-1:]))
+
             if result_mode == "intermediate":
                 continue
             state = ctx.request_states.get(req_id)
@@ -412,14 +495,71 @@ class QwenNativeMTPProposer:
                 )
             ):
                 continue
-            draft = self._draft_after_prefill_sample(
-                request_state,
-                int(sampled_token_id),
-                prefill.block_ids,
+            final_prefills.append(
+                (
+                    req_id,
+                    request_state,
+                    int(sampled_token_id),
+                    prefill.block_ids,
+                )
             )
+
+        decode_drafts = self._run_pairs_batch(
+            first_stage,
+            draft_request_indices=decode_indices,
+        )
+        for request_state, pending_hidden in pending_hidden_updates:
+            request_state.pending_hidden = pending_hidden
+        for req_id, draft in zip(
+            decode_req_ids,
+            decode_drafts,
+            strict=True,
+        ):
+            draft_req_ids.append(req_id)
+            drafts.append([draft])
+
+        final_stage: list[
+            tuple[
+                _QwenMTPRequestState,
+                mx.array,
+                Sequence[int],
+                Sequence[Sequence[int]],
+                int,
+            ]
+        ] = []
+        final_req_ids: list[str] = []
+        final_states: list[_QwenMTPRequestState] = []
+        for req_id, request_state, sampled_token_id, block_ids in final_prefills:
+            if request_state.pending_hidden is None:
+                raise RuntimeError(
+                    "Qwen MTP final prefill has no boundary hidden state"
+                )
+            final_req_ids.append(req_id)
+            final_states.append(request_state)
+            final_stage.append(
+                (
+                    request_state,
+                    request_state.pending_hidden,
+                    [sampled_token_id],
+                    block_ids,
+                    request_state.next_mtp_position,
+                )
+            )
+
+        final_drafts = self._run_pairs_batch(final_stage)
+        for request_state in final_states:
+            request_state.pending_hidden = None
+        for req_id, draft in zip(
+            final_req_ids,
+            final_drafts,
+            strict=True,
+        ):
             draft_req_ids.append(req_id)
             drafts.append([draft])
 
         if not drafts:
             return None
-        return DraftTokenIds(req_ids=draft_req_ids, draft_token_ids=drafts)
+        return DraftTokenIds(
+            req_ids=draft_req_ids,
+            draft_token_ids=drafts,
+        )
