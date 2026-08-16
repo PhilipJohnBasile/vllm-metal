@@ -1,0 +1,114 @@
+name: Apply Qwen MTP wrapper metadata fix
+
+on:
+  push:
+    branches:
+      - pr/610-05-paged-qwen-mtp-prefix
+    paths:
+      - .github/workflows/fix-qwen-mtp-wrapper.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: pr/610-05-paged-qwen-mtp-prefix
+          fetch-depth: 0
+
+      - name: Apply wrapper metadata fix and regression test
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('vllm_metal/v1/cache_policy.py')
+          text = path.read_text()
+          old = '''        mtp = getattr(model, "mtp", None)\n        args = getattr(model, "args", None)\n        layers = list(getattr(mtp, "layers", ()))\n        if mtp is None or args is None or not layers:\n            raise ValueError("native Qwen MTP requires model.mtp.layers and model.args")\n'''
+          new = '''        # Qwen3.5's multimodal-compatible MLX wrapper exposes the text model\n        # as ``language_model`` while delegating supports_mtp/mtp_forward at the\n        # top level. Cache ownership needs the text model itself because that is\n        # where the trained MTP module and TextModelArgs live. Dense/text-only\n        # models without the wrapper continue to use the object directly.\n        mtp_model = getattr(model, "language_model", model)\n        mtp = getattr(mtp_model, "mtp", None)\n        args = getattr(mtp_model, "args", None)\n        layers = list(getattr(mtp, "layers", ()))\n        if mtp is None or args is None or not layers:\n            raise ValueError(\n                "native Qwen MTP requires the loaded text model to expose "\n                "mtp.layers and args"\n            )\n'''
+          if old not in text:
+              raise SystemExit('expected _qwen_mtp_metadata block not found')
+          text = text.replace(old, new, 1)
+          old_return = '        return model, len(layers), num_kv_heads, head_dim, hidden_size\n'
+          new_return = '        return mtp_model, len(layers), num_kv_heads, head_dim, hidden_size\n'
+          if old_return not in text:
+              raise SystemExit('expected metadata return not found')
+          text = text.replace(old_return, new_return, 1)
+          path.write_text(text)
+          PY
+
+          cat > tests/test_qwen_mtp_wrapper_metadata.py <<'PY'
+          # SPDX-License-Identifier: Apache-2.0
+          from types import SimpleNamespace
+
+          from vllm_metal.v1.cache_policy import ModelCachePolicy
+
+
+          def test_qwen_mtp_metadata_unwraps_language_model() -> None:
+              args = SimpleNamespace(
+                  num_key_value_heads=2,
+                  head_dim=64,
+                  hidden_size=1024,
+              )
+              text_model = SimpleNamespace(
+                  mtp=SimpleNamespace(layers=[object()]),
+                  args=args,
+              )
+              wrapper = SimpleNamespace(
+                  supports_mtp=True,
+                  language_model=text_model,
+              )
+              runner = SimpleNamespace(
+                  vllm_config=SimpleNamespace(
+                      speculative_config=SimpleNamespace(method="mtp")
+                  ),
+                  _forward_model=wrapper,
+              )
+
+              policy = ModelCachePolicy(runner, object())
+              metadata = policy._qwen_mtp_metadata()
+
+              assert metadata == (text_model, 1, 2, 64, 1024)
+
+
+          def test_qwen_mtp_metadata_keeps_direct_text_model() -> None:
+              args = SimpleNamespace(
+                  num_key_value_heads=4,
+                  head_dim=128,
+                  hidden_size=2048,
+              )
+              model = SimpleNamespace(
+                  supports_mtp=True,
+                  mtp=SimpleNamespace(layers=[object(), object()]),
+                  args=args,
+              )
+              runner = SimpleNamespace(
+                  vllm_config=SimpleNamespace(
+                      speculative_config=SimpleNamespace(method="mtp")
+                  ),
+                  _forward_model=model,
+              )
+
+              policy = ModelCachePolicy(runner, object())
+              metadata = policy._qwen_mtp_metadata()
+
+              assert metadata == (model, 2, 4, 128, 2048)
+          PY
+
+          rm .github/workflows/fix-qwen-mtp-wrapper.yml
+          git diff --check
+          git diff
+
+      - name: Commit fix to feature branch
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'Philip John Basile'
+          git config user.email 'PBasile@Basilecom.com'
+          git add vllm_metal/v1/cache_policy.py tests/test_qwen_mtp_wrapper_metadata.py .github/workflows/fix-qwen-mtp-wrapper.yml
+          git commit -m 'fix: unwrap Qwen text model for native MTP cache metadata'
+          git push origin HEAD:pr/610-05-paged-qwen-mtp-prefix
