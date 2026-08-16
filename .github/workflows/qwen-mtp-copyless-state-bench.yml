@@ -1,0 +1,698 @@
+name: Qwen MTP Copyless State Benchmark
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [bench/qwen-mtp-copyless-state]
+    paths: [.github/workflows/qwen-mtp-copyless-state-bench.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qwen-mtp-copyless-state-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      MODEL_DIR: /tmp/Qwen3.5-0.8B-4bit-mtp
+      RESULT_DIR: /tmp/qwen-mtp-copyless-state
+      MLX_LM_REF: ac6aaffd8fdfb8c8e713e17f155d83e3d72b0a0f
+      BENCH_REQUESTS: "8"
+      BENCH_CONCURRENCY: "4"
+      BENCH_PROMPT_TOKENS: "1152"
+      BENCH_OUTPUT_TOKENS: "64"
+      BENCH_REQUEST_TIMEOUT_S: "300"
+      SERVER_READY_TIMEOUT_S: "300"
+      GLOO_SOCKET_IFNAME: lo0
+      VLLM_METAL_USE_PAGED_ATTENTION: "1"
+      VLLM_METAL_MEMORY_FRACTION: auto
+      VLLM_METAL_GDN_LAZY_KERNELS: "1"
+      VLLM_METAL_DECODE_PIPELINE: "0"
+      VLLM_METAL_SPEC_VERIFY_WINDOW: "0"
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install vLLM Metal and build native kernels
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip uv
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install \
+            'https://github.com/vllm-project/vllm/releases/download/v0.27.1/vllm-0.27.1%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl'
+          VLLM_METAL_BUILD_FROM_SOURCE=1 python -m pip install -e '.[dev]'
+          python -m pip install --force-reinstall --no-deps \
+            "git+https://github.com/PhilipJohnBasile/mlx-lm@${MLX_LM_REF}"
+          source scripts/lib.sh
+          ensure_metal_toolchain
+          build_native_artifacts
+          python - <<'PY'
+          import mlx.core as mx
+          import torch
+          print('MLX:', mx.__version__)
+          print('device:', mx.device_info())
+          print('MPS:', torch.backends.mps.is_available())
+          assert torch.backends.mps.is_available()
+          PY
+
+      - name: Convert Qwen3.5-0.8B and verify native MTP
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          rm -rf "$MODEL_DIR"
+          python -m mlx_lm convert \
+            --hf-path Qwen/Qwen3.5-0.8B \
+            --mlx-path "$MODEL_DIR" \
+            -q --q-bits 4 --q-group-size 64
+          python - <<'PY'
+          import os
+          from mlx_lm.utils import load
+          model, _ = load(os.environ['MODEL_DIR'])
+          assert bool(getattr(model, 'supports_mtp', False))
+          assert model.make_mtp_cache()
+          print('native Qwen MTP verified')
+          PY
+
+      - name: Write deterministic serving benchmark client
+        shell: bash
+        run: |
+          cat >/tmp/run_copyless_case.py <<'PY'
+          import argparse
+          import asyncio
+          import hashlib
+          import json
+          import statistics
+          import time
+          from pathlib import Path
+
+          import aiohttp
+          from transformers import AutoTokenizer
+          from vllm.benchmarks.lib.endpoint_request_func import (
+              RequestFuncInput,
+              async_request_openai_completions,
+          )
+          from vllm.benchmarks.serve import fetch_spec_decode_metrics
+
+          async def main():
+              p = argparse.ArgumentParser()
+              p.add_argument('--name', required=True)
+              p.add_argument('--model-dir', required=True)
+              p.add_argument('--result', required=True)
+              p.add_argument('--port', type=int, required=True)
+              p.add_argument('--requests', type=int, required=True)
+              p.add_argument('--concurrency', type=int, required=True)
+              p.add_argument('--prompt-tokens', type=int, required=True)
+              p.add_argument('--output-tokens', type=int, required=True)
+              p.add_argument('--timeout-s', type=float, required=True)
+              a = p.parse_args()
+              base = f'http://127.0.0.1:{a.port}'
+              timeout = aiohttp.ClientTimeout(total=a.timeout_s)
+
+              async with aiohttp.ClientSession(timeout=timeout) as session:
+                  async with session.get(base + '/v1/models') as response:
+                      response.raise_for_status()
+                      model = (await response.json())['data'][0]['id']
+
+                  tok = AutoTokenizer.from_pretrained(
+                      a.model_dir, trust_remote_code=True
+                  )
+                  seed = (
+                      'Apple Silicon speculative decoding uses a shared cached '
+                      'prefix and a trained multi-token prediction head. '
+                  )
+                  text = seed
+                  while len(tok.encode(text, add_special_tokens=False)) < a.prompt_tokens + 16:
+                      text += seed
+                  ids = tok.encode(text, add_special_tokens=False)[:a.prompt_tokens]
+                  prompt = tok.decode(ids, skip_special_tokens=False)
+                  prompt_len = len(tok.encode(prompt, add_special_tokens=False))
+
+                  async def one(tag):
+                      request = RequestFuncInput(
+                          prompt=prompt,
+                          api_url=base + '/v1/completions',
+                          prompt_len=prompt_len,
+                          output_len=a.output_tokens,
+                          model=model,
+                          ignore_eos=True,
+                          extra_body={'temperature': 0},
+                      )
+                      started = time.perf_counter()
+                      output = await asyncio.wait_for(
+                          async_request_openai_completions(request, session),
+                          timeout=a.timeout_s,
+                      )
+                      if not output.success:
+                          raise RuntimeError(f'{tag}: {output.error}')
+                      print(
+                          f'{a.name} {tag}: out={output.output_tokens} '
+                          f'ttft_ms={output.ttft * 1000:.1f} '
+                          f'e2e_s={time.perf_counter() - started:.2f}',
+                          flush=True,
+                      )
+                      return output
+
+                  await one('warmup')
+                  before = await fetch_spec_decode_metrics(base, session)
+                  outputs = []
+                  started = time.perf_counter()
+                  for offset in range(0, a.requests, a.concurrency):
+                      count = min(a.concurrency, a.requests - offset)
+                      outputs.extend(await asyncio.gather(*(
+                          one(f'{offset + index + 1}/{a.requests}')
+                          for index in range(count)
+                      )))
+                  elapsed = time.perf_counter() - started
+                  after = await fetch_spec_decode_metrics(base, session)
+
+              total_output = sum(x.output_tokens for x in outputs)
+              total_input = sum(x.prompt_len for x in outputs)
+              drafts = accepted = 0
+              if before is not None and after is not None:
+                  drafts = after.num_draft_tokens - before.num_draft_tokens
+                  accepted = after.num_accepted_tokens - before.num_accepted_tokens
+              output_payload = json.dumps(
+                  [x.generated_text for x in outputs],
+                  ensure_ascii=False,
+                  separators=(',', ':'),
+              ).encode()
+              result = {
+                  'name': a.name,
+                  'requests': len(outputs),
+                  'concurrency': a.concurrency,
+                  'prompt_tokens_per_request': prompt_len,
+                  'output_tokens_per_request': a.output_tokens,
+                  'elapsed_s': elapsed,
+                  'output_throughput_tok_s': total_output / elapsed,
+                  'total_token_throughput_tok_s': (total_input + total_output) / elapsed,
+                  'mean_ttft_ms': statistics.mean(x.ttft * 1000 for x in outputs),
+                  'median_ttft_ms': statistics.median(x.ttft * 1000 for x in outputs),
+                  'mean_e2e_ms': statistics.mean(x.latency * 1000 for x in outputs),
+                  'mtp_draft_tokens': drafts,
+                  'mtp_accepted_tokens': accepted,
+                  'mtp_acceptance_rate': accepted / drafts if drafts else None,
+                  'output_sha256': hashlib.sha256(output_payload).hexdigest(),
+              }
+              Path(a.result).write_text(json.dumps(result, indent=2) + '\n')
+              print('COPYLESS_RESULT=' + json.dumps(result, sort_keys=True), flush=True)
+
+          asyncio.run(main())
+          PY
+
+      - name: Run control, apply copyless patch, test, and rerun
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          rm -rf "$RESULT_DIR"
+          mkdir -p "$RESULT_DIR"
+          cp vllm_metal/attention/impls/gdn_lazy.py /tmp/gdn_lazy.py.orig
+          cp vllm_metal/attention/impls/linear.py /tmp/linear.py.orig
+          SERVER_PID=""
+          SERVER_LOG=""
+          PORT=8400
+
+          stop_server() {
+            [ -z "${SERVER_PID:-}" ] && return 0
+            pkill -TERM -P "$SERVER_PID" 2>/dev/null || true
+            kill -TERM "$SERVER_PID" 2>/dev/null || true
+            for _ in $(seq 1 15); do
+              kill -0 "$SERVER_PID" 2>/dev/null || break
+              sleep 1
+            done
+            pkill -KILL -P "$SERVER_PID" 2>/dev/null || true
+            kill -KILL "$SERVER_PID" 2>/dev/null || true
+            wait "$SERVER_PID" 2>/dev/null || true
+            SERVER_PID=""
+          }
+          trap stop_server EXIT INT TERM
+
+          wait_ready() {
+            local port="$1" deadline=$((SECONDS + SERVER_READY_TIMEOUT_S))
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              if curl --connect-timeout 1 --max-time 1 -fsS \
+                "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
+                return 0
+              fi
+              if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+                tail -n 240 "$SERVER_LOG" || true
+                return 1
+              fi
+              sleep 2
+            done
+            tail -n 240 "$SERVER_LOG" || true
+            return 1
+          }
+
+          run_case() {
+            local name="$1" port="$PORT"
+            PORT=$((PORT + 1))
+            SERVER_LOG="$RESULT_DIR/server-${name}.log"
+            vllm serve "$MODEL_DIR" \
+              --served-model-name qwen35-mtp-copyless \
+              --enable-prefix-caching \
+              --no-async-scheduling \
+              --max-model-len 1280 \
+              --max-num-seqs 4 \
+              --max-num-batched-tokens 2048 \
+              --block-size 16 \
+              --enforce-eager \
+              --stream-interval 1 \
+              --speculative-config '{"method":"mtp","num_speculative_tokens":1}' \
+              --port "$port" >"$SERVER_LOG" 2>&1 &
+            SERVER_PID=$!
+            wait_ready "$port"
+            python /tmp/run_copyless_case.py \
+              --name "$name" \
+              --model-dir "$MODEL_DIR" \
+              --result "$RESULT_DIR/${name}.json" \
+              --port "$port" \
+              --requests "$BENCH_REQUESTS" \
+              --concurrency "$BENCH_CONCURRENCY" \
+              --prompt-tokens "$BENCH_PROMPT_TOKENS" \
+              --output-tokens "$BENCH_OUTPUT_TOKENS" \
+              --timeout-s "$BENCH_REQUEST_TIMEOUT_S"
+            stop_server
+            sleep 3
+          }
+
+          run_case control_start
+
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{label}: expected one match, found {count}')
+              return text.replace(old, new, 1)
+
+          lazy_path = Path('vllm_metal/attention/impls/gdn_lazy.py')
+          lazy = lazy_path.read_text()
+          lazy = replace_once(
+              lazy,
+              '''class GDNRecurrentDecodeRequest(GDNRecurrentRequest):
+    """Inputs for one lazy GDN recurrent decode attempt."""
+
+    threadgroup_dv: int = 4
+''',
+              '''class GDNRecurrentDecodeRequest(GDNRecurrentRequest):
+    """Inputs for one lazy GDN recurrent decode attempt."""
+
+    threadgroup_dv: int = 4
+    # Read from slot_ids while scattering compact updates into these slots.
+    # This removes the full recurrent-pool src→dst copy in one-draft verify.
+    write_slot_ids: list[int] | None = None
+''',
+              'decode request destination slots',
+          )
+          lazy = replace_once(
+              lazy,
+              '''        cache_idx: int,
+        slot_ids: list[int],
+    ) -> mx.array | None:
+        """Run the lazy GDN conv decode fast path, or return None."""
+''',
+              '''        cache_idx: int,
+        slot_ids: list[int],
+        write_slot_ids: list[int] | None = None,
+    ) -> mx.array | None:
+        """Run the lazy GDN conv decode fast path, or return None.
+
+        ``slot_ids`` address the source state. ``write_slot_ids`` optionally
+        selects different stable-cache destinations for the compact updates.
+        """
+''',
+              'conv destination signature',
+          )
+          lazy = replace_once(
+              lazy,
+              '''        state_view = state_cache.conv_state_for_decode(cache_idx, slot_ids)
+        conv_state_in = state_view.state
+        state_pool = state_cache.conv_states[cache_idx]
+        weight = inner.conv1d.weight
+
+        mixed_qkv_2d = mixed_qkv.reshape(num_requests, conv_dim)
+        slot_ids_arr = state_view.cache_slot_ids
+        state_slot_ids_arr = state_view.state_slot_ids
+''',
+              '''        state_view = state_cache.conv_state_for_decode(cache_idx, slot_ids)
+        destination_slots = slot_ids if write_slot_ids is None else write_slot_ids
+        if len(destination_slots) != num_requests:
+            raise RuntimeError("GDN conv decode destination count mismatch")
+        state_cache.require_allocated_slots(destination_slots)
+        if destination_slots != slot_ids and state_view.uses_compact_state:
+            raise RuntimeError(
+                "copyless GDN conv decode requires stable source state"
+            )
+        conv_state_in = state_view.state
+        state_pool = state_cache.conv_states[cache_idx]
+        weight = inner.conv1d.weight
+
+        mixed_qkv_2d = mixed_qkv.reshape(num_requests, conv_dim)
+        slot_ids_arr = state_view.cache_slot_ids
+        write_slot_ids_arr = (
+            slot_ids_arr
+            if destination_slots == slot_ids
+            else mx.array(destination_slots, dtype=mx.int32)
+        )
+        state_slot_ids_arr = state_view.state_slot_ids
+''',
+              'conv destination setup',
+          )
+          lazy = replace_once(
+              lazy,
+              '        state_pool[slot_ids_arr] = conv_state_updates\n',
+              '        state_pool[write_slot_ids_arr] = conv_state_updates\n',
+              'conv destination scatter',
+          )
+          lazy = replace_once(
+              lazy,
+              '''        state_view = state_cache.recurrent_state_for_decode(
+            request.cache_idx, request.slot_ids
+        )
+        state_in = state_view.state
+        state_pool = state_cache.recurrent_states[request.cache_idx]
+        slot_ids_arr = state_view.cache_slot_ids
+        state_slot_ids_arr = state_view.state_slot_ids
+''',
+              '''        state_view = state_cache.recurrent_state_for_decode(
+            request.cache_idx, request.slot_ids
+        )
+        destination_slots = (
+            request.slot_ids
+            if request.write_slot_ids is None
+            else request.write_slot_ids
+        )
+        if len(destination_slots) != num_requests:
+            raise RuntimeError("GDN recurrent destination count mismatch")
+        state_cache.require_allocated_slots(destination_slots)
+        if destination_slots != request.slot_ids and state_view.uses_compact_state:
+            raise RuntimeError(
+                "copyless GDN recurrent decode requires stable source state"
+            )
+        state_in = state_view.state
+        state_pool = state_cache.recurrent_states[request.cache_idx]
+        slot_ids_arr = state_view.cache_slot_ids
+        write_slot_ids_arr = (
+            slot_ids_arr
+            if destination_slots == request.slot_ids
+            else mx.array(destination_slots, dtype=mx.int32)
+        )
+        state_slot_ids_arr = state_view.state_slot_ids
+''',
+              'recurrent destination setup',
+          )
+          lazy = replace_once(
+              lazy,
+              '        state_pool[slot_ids_arr] = state_updates\n',
+              '        state_pool[write_slot_ids_arr] = state_updates\n',
+              'recurrent destination scatter',
+          )
+          lazy_path.write_text(lazy)
+
+          linear_path = Path('vllm_metal/attention/impls/linear.py')
+          linear = linear_path.read_text()
+          linear = replace_once(
+              linear,
+              '''        cache_idx = self._gdn_cache_idx
+        pool = self._gdn_state_cache.conv_states[cache_idx]
+        src = mx.array(rollback_slots, dtype=mx.int32)
+        dst = mx.array(speculative_slots, dtype=mx.int32)
+        pool[dst] = pool[src]
+        self._gdn_state_cache.store_conv_state(cache_idx, pool)
+
+        second = self._gdn_lazy.try_conv_decode(
+            mixed_qkv[:, 1::2, :],
+            self._inner,
+            self._gdn_state_cache,
+            cache_idx,
+            speculative_slots,
+        )
+''',
+              '''        second = self._gdn_lazy.try_conv_decode(
+            mixed_qkv[:, 1::2, :],
+            self._inner,
+            self._gdn_state_cache,
+            self._gdn_cache_idx,
+            rollback_slots,
+            write_slot_ids=speculative_slots,
+        )
+''',
+              'copyless conv verify',
+          )
+          linear = replace_once(
+              linear,
+              '''        def request(rows: slice, slot_ids: list[int]) -> GDNRecurrentDecodeRequest:
+            return GDNRecurrentDecodeRequest(
+                q=q[:, rows],
+                k=k[:, rows],
+                v=v[:, rows],
+                g=g[:, rows],
+                beta=beta[:, rows],
+                state_cache=self._gdn_state_cache,
+                cache_idx=self._gdn_cache_idx,
+                slot_ids=slot_ids,
+                output_dtype=state.x.dtype,
+                threadgroup_dv=self._recurrent_decode_threadgroup_dv(),
+            )
+''',
+              '''        def request(
+            rows: slice,
+            slot_ids: list[int],
+            write_slot_ids: list[int] | None = None,
+        ) -> GDNRecurrentDecodeRequest:
+            return GDNRecurrentDecodeRequest(
+                q=q[:, rows],
+                k=k[:, rows],
+                v=v[:, rows],
+                g=g[:, rows],
+                beta=beta[:, rows],
+                state_cache=self._gdn_state_cache,
+                cache_idx=self._gdn_cache_idx,
+                slot_ids=slot_ids,
+                output_dtype=state.x.dtype,
+                threadgroup_dv=self._recurrent_decode_threadgroup_dv(),
+                write_slot_ids=write_slot_ids,
+            )
+''',
+              'recurrent request destination',
+          )
+          linear = replace_once(
+              linear,
+              '''        cache_idx = self._gdn_cache_idx
+        pool = self._gdn_state_cache.recurrent_states[cache_idx]
+        src = mx.array(rollback_slots, dtype=mx.int32)
+        dst = mx.array(speculative_slots, dtype=mx.int32)
+        pool[dst] = pool[src]
+        self._gdn_state_cache.store_recurrent_state(cache_idx, pool)
+
+        second = self._gdn_lazy.try_recurrent_decode(
+            request(slice(1, None, 2), speculative_slots)
+        )
+''',
+              '''        second = self._gdn_lazy.try_recurrent_decode(
+            request(
+                slice(1, None, 2),
+                rollback_slots,
+                write_slot_ids=speculative_slots,
+            )
+        )
+''',
+              'copyless recurrent verify',
+          )
+          linear_path.write_text(linear)
+
+          test_path = Path('tests/test_gdn_lazy_wrapper.py')
+          tests = test_path.read_text()
+          tests = replace_once(
+              tests,
+              '''                self.conv_slots: list[list[int]] = []
+                self.recurrent_slots: list[list[int]] = []
+
+            def try_conv_decode(self, mixed_qkv, _inner, _cache, _cache_idx, slot_ids):
+                self.conv_slots.append(list(slot_ids))
+                return mixed_qkv
+
+            def try_recurrent_decode(self, request):
+                self.recurrent_slots.append(list(request.slot_ids))
+''',
+              '''                self.conv_slots: list[list[int]] = []
+                self.conv_writes: list[list[int]] = []
+                self.recurrent_slots: list[list[int]] = []
+                self.recurrent_writes: list[list[int]] = []
+
+            def try_conv_decode(
+                self,
+                mixed_qkv,
+                _inner,
+                _cache,
+                _cache_idx,
+                slot_ids,
+                write_slot_ids=None,
+            ):
+                self.conv_slots.append(list(slot_ids))
+                self.conv_writes.append(list(write_slot_ids or slot_ids))
+                return mixed_qkv
+
+            def try_recurrent_decode(self, request):
+                self.recurrent_slots.append(list(request.slot_ids))
+                self.recurrent_writes.append(
+                    list(request.write_slot_ids or request.slot_ids)
+                )
+''',
+              'fake lazy destinations',
+          )
+          tests = replace_once(
+              tests,
+              '''        assert fake.conv_slots == [[0, 2], [1, 3]]
+''',
+              '''        assert fake.conv_slots == [[0, 2], [0, 2]]
+        assert fake.conv_writes == [[0, 2], [1, 3]]
+''',
+              'conv destination assertion',
+          )
+          tests = replace_once(
+              tests,
+              '''        assert fake.recurrent_slots == [[0, 2], [1, 3]]
+''',
+              '''        assert fake.recurrent_slots == [[0, 2], [0, 2]]
+        assert fake.recurrent_writes == [[0, 2], [1, 3]]
+''',
+              'recurrent destination assertion',
+          )
+          test_path.write_text(tests)
+          PY
+
+          python -m py_compile \
+            vllm_metal/attention/impls/gdn_lazy.py \
+            vllm_metal/attention/impls/linear.py
+          pytest -q \
+            tests/test_gdn_lazy_wrapper.py \
+            tests/attention/test_align_gdn_state_manager.py \
+            tests/test_qwen_native_mtp_proposer.py \
+            tests/test_qwen_mtp_paged_cache.py \
+            2>&1 | tee "$RESULT_DIR/pytest-copyless.log"
+          git diff -- \
+            vllm_metal/attention/impls/gdn_lazy.py \
+            vllm_metal/attention/impls/linear.py \
+            tests/test_gdn_lazy_wrapper.py \
+            > "$RESULT_DIR/copyless-state.patch"
+
+          run_case copyless
+
+          cp /tmp/gdn_lazy.py.orig vllm_metal/attention/impls/gdn_lazy.py
+          cp /tmp/linear.py.orig vllm_metal/attention/impls/linear.py
+          python -m py_compile \
+            vllm_metal/attention/impls/gdn_lazy.py \
+            vllm_metal/attention/impls/linear.py
+          run_case control_end
+
+      - name: Compare control and copyless results
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import statistics
+          from pathlib import Path
+
+          root = Path('/tmp/qwen-mtp-copyless-state')
+          rows = {}
+          for name in ('control_start', 'copyless', 'control_end'):
+              path = root / f'{name}.json'
+              if path.exists():
+                  rows[name] = json.loads(path.read_text())
+
+          start = rows.get('control_start')
+          patched = rows.get('copyless')
+          end = rows.get('control_end')
+          controls = [x for x in (start, end) if x is not None]
+          median_control = statistics.median(
+              row['output_throughput_tok_s'] for row in controls
+          ) if controls else None
+          speedup = (
+              patched['output_throughput_tok_s'] / median_control
+              if patched and median_control else None
+          )
+          hashes_match = bool(
+              patched
+              and controls
+              and all(
+                  row['output_sha256'] == patched['output_sha256']
+                  for row in controls
+              )
+          )
+          drift = (
+              (end['output_throughput_tok_s'] / start['output_throughput_tok_s'] - 1)
+              * 100
+              if start and end else None
+          )
+          summary = {
+              'median_control_output_tok_s': median_control,
+              'copyless_speedup': speedup,
+              'control_drift_percent': drift,
+              'outputs_identical': hashes_match,
+              'results': rows,
+          }
+          (root / 'copyless-summary.json').write_text(
+              json.dumps(summary, indent=2, sort_keys=True) + '\n'
+          )
+
+          def f(value, suffix=''):
+              return 'n/a' if value is None else f'{value:.3f}{suffix}'
+
+          lines = [
+              '# Qwen MTP copyless GDN state A/B',
+              '',
+              f"- Median control: {f(median_control, ' output tok/s')}",
+              f"- Copyless speedup: {f(speedup, 'x')}",
+              f"- Control drift: {f(drift, '%')}",
+              f"- Greedy outputs identical: **{hashes_match}**",
+              '',
+              '| Case | Output tok/s | TTFT ms | E2E ms | Accept | Output SHA-256 |',
+              '|---|---:|---:|---:|---:|---|',
+          ]
+          for name in ('control_start', 'copyless', 'control_end'):
+              row = rows.get(name)
+              if not row:
+                  continue
+              acceptance = row.get('mtp_acceptance_rate')
+              acceptance_text = (
+                  'n/a' if acceptance is None else f'{acceptance * 100:.1f}%'
+              )
+              lines.append(
+                  f"| {name} | {row['output_throughput_tok_s']:.3f} | "
+                  f"{row['mean_ttft_ms']:.1f} | {row['mean_e2e_ms']:.1f} | "
+                  f"{acceptance_text} | `{row['output_sha256']}` |"
+              )
+          report = '\n'.join(lines) + '\n'
+          (root / 'copyless-summary.md').write_text(report)
+          print(report)
+          with Path(__import__('os').environ['GITHUB_STEP_SUMMARY']).open('a') as handle:
+              handle.write(report)
+          if patched and not hashes_match:
+              raise SystemExit('copyless patch changed deterministic output')
+          PY
+
+      - name: Upload copyless benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-mtp-copyless-state-benchmark
+          path: ${{ env.RESULT_DIR }}
+          if-no-files-found: warn
