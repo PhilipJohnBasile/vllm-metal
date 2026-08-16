@@ -1,0 +1,588 @@
+name: Qwen MTP Speed Matrix Phase 2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [bench/qwen-mtp-speed-matrix]
+    paths: [.github/workflows/qwen-mtp-speed-matrix-phase2.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qwen-mtp-speed-matrix-phase2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tune:
+    runs-on: macos-15
+    timeout-minutes: 50
+    env:
+      MODEL_DIR: /tmp/Qwen3.5-0.8B-4bit-mtp
+      RESULT_DIR: /tmp/qwen-mtp-speed-matrix-phase2
+      MLX_LM_REF: ac6aaffd8fdfb8c8e713e17f155d83e3d72b0a0f
+      BENCH_REQUESTS: "4"
+      BENCH_CONCURRENCY: "4"
+      BENCH_PROMPT_TOKENS: "1152"
+      BENCH_OUTPUT_TOKENS: "64"
+      BENCH_REQUEST_TIMEOUT_S: "300"
+      SERVER_READY_TIMEOUT_S: "300"
+      GLOO_SOCKET_IFNAME: lo0
+      VLLM_METAL_USE_PAGED_ATTENTION: "1"
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install vLLM Metal and build native kernels
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip uv
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install \
+            'https://github.com/vllm-project/vllm/releases/download/v0.27.1/vllm-0.27.1%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl'
+          VLLM_METAL_BUILD_FROM_SOURCE=1 python -m pip install -e '.[dev]'
+          python -m pip install --force-reinstall --no-deps \
+            "git+https://github.com/PhilipJohnBasile/mlx-lm@${MLX_LM_REF}"
+          source scripts/lib.sh
+          ensure_metal_toolchain
+          build_native_artifacts
+          python - <<'PY'
+          import mlx.core as mx
+          import torch
+          print('MLX:', mx.__version__)
+          print('device:', mx.device_info())
+          print('MPS:', torch.backends.mps.is_available())
+          assert torch.backends.mps.is_available()
+          PY
+
+      - name: Convert Qwen3.5-0.8B and verify native MTP
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          rm -rf "$MODEL_DIR"
+          python -m mlx_lm convert \
+            --hf-path Qwen/Qwen3.5-0.8B \
+            --mlx-path "$MODEL_DIR" \
+            -q --q-bits 4 --q-group-size 64
+          python - <<'PY'
+          import os
+          from mlx_lm.utils import load
+          model, _ = load(os.environ['MODEL_DIR'])
+          cache = model.make_mtp_cache()
+          print('supports_mtp:', getattr(model, 'supports_mtp', None))
+          print('mtp_cache_entries:', len(cache))
+          assert bool(getattr(model, 'supports_mtp', False))
+          assert cache
+          PY
+
+      - name: Write benchmark client
+        shell: bash
+        run: |
+          cat >/tmp/run_phase2_case.py <<'PY'
+          import argparse
+          import asyncio
+          import json
+          import statistics
+          import time
+          from pathlib import Path
+
+          import aiohttp
+          from transformers import AutoTokenizer
+          from vllm.benchmarks.lib.endpoint_request_func import (
+              RequestFuncInput,
+              async_request_openai_completions,
+          )
+          from vllm.benchmarks.serve import fetch_spec_decode_metrics
+
+          async def get_raw_metrics(base, session):
+              try:
+                  async with session.get(base + '/metrics') as response:
+                      if response.status != 200:
+                          return ''
+                      text = await response.text()
+                      return '\n'.join(
+                          line for line in text.splitlines()
+                          if line.startswith('vllm:spec_decode')
+                          or line.startswith('# HELP vllm:spec_decode')
+                          or line.startswith('# TYPE vllm:spec_decode')
+                      ) + '\n'
+              except Exception as exc:
+                  return f'# metrics fetch failed: {exc!r}\n'
+
+          async def main():
+              p = argparse.ArgumentParser()
+              p.add_argument('--name', required=True)
+              p.add_argument('--model-dir', required=True)
+              p.add_argument('--result', required=True)
+              p.add_argument('--metrics-file', required=True)
+              p.add_argument('--port', type=int, required=True)
+              p.add_argument('--requests', type=int, required=True)
+              p.add_argument('--concurrency', type=int, required=True)
+              p.add_argument('--prompt-tokens', type=int, required=True)
+              p.add_argument('--output-tokens', type=int, required=True)
+              p.add_argument('--timeout-s', type=float, required=True)
+              p.add_argument('--speculative', type=int, required=True)
+              p.add_argument('--batch-tokens', type=int, required=True)
+              p.add_argument('--pipeline', type=int, required=True)
+              p.add_argument('--stream-interval', type=int, required=True)
+              p.add_argument('--prefix-caching', type=int, required=True)
+              p.add_argument('--memory-fraction', required=True)
+              p.add_argument('--log-stats', type=int, required=True)
+              a = p.parse_args()
+              base = f'http://127.0.0.1:{a.port}'
+              timeout = aiohttp.ClientTimeout(total=a.timeout_s)
+
+              async with aiohttp.ClientSession(timeout=timeout) as session:
+                  async with session.get(base + '/v1/models') as response:
+                      response.raise_for_status()
+                      model = (await response.json())['data'][0]['id']
+
+                  tok = AutoTokenizer.from_pretrained(
+                      a.model_dir, trust_remote_code=True
+                  )
+                  seed = (
+                      'Apple Silicon speculative decoding uses a shared cached '
+                      'prefix and a trained multi-token prediction head. '
+                  )
+                  text = seed
+                  while len(tok.encode(text, add_special_tokens=False)) < a.prompt_tokens + 16:
+                      text += seed
+                  ids = tok.encode(text, add_special_tokens=False)[:a.prompt_tokens]
+                  prompt = tok.decode(ids, skip_special_tokens=False)
+                  prompt_len = len(tok.encode(prompt, add_special_tokens=False))
+
+                  async def one(tag):
+                      request = RequestFuncInput(
+                          prompt=prompt,
+                          api_url=base + '/v1/completions',
+                          prompt_len=prompt_len,
+                          output_len=a.output_tokens,
+                          model=model,
+                          ignore_eos=True,
+                          extra_body={'temperature': 0},
+                      )
+                      started = time.perf_counter()
+                      output = await asyncio.wait_for(
+                          async_request_openai_completions(request, session),
+                          timeout=a.timeout_s,
+                      )
+                      if not output.success:
+                          raise RuntimeError(f'{tag}: {output.error}')
+                      print(
+                          f'{a.name} {tag}: out={output.output_tokens} '
+                          f'ttft_ms={output.ttft * 1000:.1f} '
+                          f'e2e_s={time.perf_counter() - started:.2f}',
+                          flush=True,
+                      )
+                      return output
+
+                  await one('warmup')
+                  before = await fetch_spec_decode_metrics(base, session)
+                  raw_before = await get_raw_metrics(base, session)
+                  outputs = []
+                  started = time.perf_counter()
+                  for offset in range(0, a.requests, a.concurrency):
+                      count = min(a.concurrency, a.requests - offset)
+                      outputs.extend(await asyncio.gather(*(
+                          one(f'{offset + index + 1}/{a.requests}')
+                          for index in range(count)
+                      )))
+                  elapsed = time.perf_counter() - started
+                  after = await fetch_spec_decode_metrics(base, session)
+                  raw_after = await get_raw_metrics(base, session)
+
+              Path(a.metrics_file).write_text(
+                  '# BEFORE\n' + raw_before + '# AFTER\n' + raw_after
+              )
+              total_output = sum(x.output_tokens for x in outputs)
+              total_input = sum(x.prompt_len for x in outputs)
+              drafts = accepted = 0
+              if before is not None and after is not None:
+                  drafts = after.num_draft_tokens - before.num_draft_tokens
+                  accepted = after.num_accepted_tokens - before.num_accepted_tokens
+              result = {
+                  'name': a.name,
+                  'status': 'success',
+                  'speculative': bool(a.speculative),
+                  'max_num_seqs': 4,
+                  'max_num_batched_tokens': a.batch_tokens,
+                  'decode_pipeline': bool(a.pipeline),
+                  'stream_interval': a.stream_interval,
+                  'prefix_caching': bool(a.prefix_caching),
+                  'memory_fraction': a.memory_fraction,
+                  'log_stats': bool(a.log_stats),
+                  'requests': len(outputs),
+                  'concurrency': a.concurrency,
+                  'prompt_tokens_per_request': prompt_len,
+                  'output_tokens_per_request': a.output_tokens,
+                  'completed_output_tokens': total_output,
+                  'elapsed_s': elapsed,
+                  'output_throughput_tok_s': total_output / elapsed,
+                  'total_token_throughput_tok_s': (total_input + total_output) / elapsed,
+                  'mean_ttft_ms': statistics.mean(x.ttft * 1000 for x in outputs),
+                  'median_ttft_ms': statistics.median(x.ttft * 1000 for x in outputs),
+                  'mean_e2e_ms': statistics.mean(x.latency * 1000 for x in outputs),
+                  'mtp_draft_tokens': drafts,
+                  'mtp_accepted_tokens': accepted,
+                  'mtp_acceptance_rate': accepted / drafts if drafts else None,
+              }
+              Path(a.result).write_text(json.dumps(result, indent=2) + '\n')
+              print('PHASE2_RESULT=' + json.dumps(result, sort_keys=True), flush=True)
+
+          asyncio.run(main())
+          PY
+
+      - name: Run focused scheduler, streaming, and memory matrix
+        shell: bash
+        run: |
+          set -uo pipefail
+          source .venv/bin/activate
+          rm -rf "$RESULT_DIR"
+          mkdir -p "$RESULT_DIR"
+          SERVER_PID=""
+          SERVER_LOG=""
+          PORT=8300
+
+          stop_server() {
+            [ -z "${SERVER_PID:-}" ] && return 0
+            pkill -TERM -P "$SERVER_PID" 2>/dev/null || true
+            kill -TERM "$SERVER_PID" 2>/dev/null || true
+            for _ in $(seq 1 15); do
+              kill -0 "$SERVER_PID" 2>/dev/null || break
+              sleep 1
+            done
+            pkill -KILL -P "$SERVER_PID" 2>/dev/null || true
+            kill -KILL "$SERVER_PID" 2>/dev/null || true
+            wait "$SERVER_PID" 2>/dev/null || true
+            SERVER_PID=""
+          }
+          trap stop_server EXIT INT TERM
+
+          wait_ready() {
+            local port="$1" deadline=$((SECONDS + SERVER_READY_TIMEOUT_S))
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              if curl --connect-timeout 1 --max-time 1 -fsS \
+                "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
+                return 0
+              fi
+              if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+                return 1
+              fi
+              sleep 2
+            done
+            return 1
+          }
+
+          record_failure() {
+            local name="$1" message="$2" result="$RESULT_DIR/${name}.json"
+            NAME="$name" MESSAGE="$message" RESULT="$result" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          Path(os.environ['RESULT']).write_text(json.dumps({
+              'name': os.environ['NAME'],
+              'status': 'failed',
+              'error': os.environ['MESSAGE'],
+          }, indent=2) + '\n')
+          PY
+          }
+
+          run_case() {
+            local name="$1" speculative="$2" batch="$3" pipeline="$4"
+            local stream="$5" prefix="$6" memory="$7" log_stats="$8"
+            local port="$PORT"
+            PORT=$((PORT + 1))
+            SERVER_LOG="$RESULT_DIR/server-${name}.log"
+
+            cmd=(
+              vllm serve "$MODEL_DIR"
+              --served-model-name qwen35-mtp-phase2
+              --no-async-scheduling
+              --max-model-len 1280
+              --max-num-seqs 4
+              --max-num-batched-tokens "$batch"
+              --block-size 16
+              --enforce-eager
+              --stream-interval "$stream"
+              --port "$port"
+            )
+            [ "$prefix" = 0 ] || cmd+=(--enable-prefix-caching)
+            [ "$log_stats" = 1 ] || cmd+=(--disable-log-stats)
+            [ "$speculative" = 0 ] || cmd+=(
+              --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
+            )
+
+            echo "=== $name: batch=$batch pipeline=$pipeline stream=$stream prefix=$prefix memory=$memory log_stats=$log_stats ==="
+            VLLM_METAL_MEMORY_FRACTION="$memory" \
+            VLLM_METAL_GDN_LAZY_KERNELS=1 \
+            VLLM_METAL_DECODE_PIPELINE="$pipeline" \
+            VLLM_METAL_SPEC_VERIFY_WINDOW=0 \
+              "${cmd[@]}" >"$SERVER_LOG" 2>&1 &
+            SERVER_PID=$!
+
+            if ! wait_ready "$port"; then
+              tail -n 180 "$SERVER_LOG" || true
+              record_failure "$name" 'server failed to become ready'
+              stop_server
+              return 0
+            fi
+
+            python /tmp/run_phase2_case.py \
+              --name "$name" \
+              --model-dir "$MODEL_DIR" \
+              --result "$RESULT_DIR/${name}.json" \
+              --metrics-file "$RESULT_DIR/metrics-${name}.txt" \
+              --port "$port" \
+              --requests "$BENCH_REQUESTS" \
+              --concurrency "$BENCH_CONCURRENCY" \
+              --prompt-tokens "$BENCH_PROMPT_TOKENS" \
+              --output-tokens "$BENCH_OUTPUT_TOKENS" \
+              --timeout-s "$BENCH_REQUEST_TIMEOUT_S" \
+              --speculative "$speculative" \
+              --batch-tokens "$batch" \
+              --pipeline "$pipeline" \
+              --stream-interval "$stream" \
+              --prefix-caching "$prefix" \
+              --memory-fraction "$memory" \
+              --log-stats "$log_stats"
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              tail -n 180 "$SERVER_LOG" || true
+              record_failure "$name" "benchmark exited ${status}"
+            fi
+            stop_server
+            sleep 2
+          }
+
+          # Thermal/drift controls.
+          run_case baseline_b2048_s1_start 0 2048 1 1 1 auto 0
+
+          # Scheduler budget and decode pipeline sweep.
+          run_case mtp_b2048_pipe1_s1 1 2048 1 1 1 auto 0
+          run_case mtp_b2048_pipe0_s1 1 2048 0 1 1 auto 0
+          run_case mtp_b3072_pipe1_s1 1 3072 1 1 1 auto 0
+          run_case mtp_b3072_pipe0_s1 1 3072 0 1 1 auto 0
+          run_case mtp_b4096_pipe1_s1 1 4096 1 1 1 auto 0
+          run_case mtp_b4096_pipe0_s1 1 4096 0 1 1 auto 0
+          run_case mtp_b4608_pipe0_s1 1 4608 0 1 1 auto 0
+          run_case mtp_b5120_pipe0_s1 1 5120 0 1 1 auto 0
+
+          # Streaming amortization at the largest valid four-request budget.
+          run_case mtp_b5120_pipe0_s4  1 5120 0 4  1 auto 0
+          run_case mtp_b5120_pipe0_s8  1 5120 0 8  1 auto 0
+          run_case mtp_b5120_pipe0_s16 1 5120 0 16 1 auto 0
+
+          # Unified-memory pressure and prefix-cache controls.
+          run_case mtp_b5120_pipe0_s8_mem055   1 5120 0 8 1 0.55 0
+          run_case mtp_b5120_pipe0_s8_noprefix 1 5120 0 8 0 auto 0
+
+          # Matching baselines for the likely winning configuration.
+          run_case baseline_b5120_s1 0 5120 1 1 1 auto 0
+          run_case baseline_b5120_s8 0 5120 1 8 1 auto 0
+
+          # Keep stats enabled once so Prometheus exposes real acceptance counters.
+          run_case mtp_acceptance_reference 1 5120 0 8 1 auto 1
+
+          run_case baseline_b2048_s1_end 0 2048 1 1 1 auto 0
+
+      - name: Rank focused matrix results
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv
+          import json
+          import os
+          import platform
+          import statistics
+          import subprocess
+          from pathlib import Path
+
+          root = Path(os.environ['RESULT_DIR'])
+          rows = []
+          for path in sorted(root.glob('*.json')):
+              try:
+                  row = json.loads(path.read_text())
+              except Exception:
+                  continue
+              if 'name' in row:
+                  rows.append(row)
+
+          controls = [
+              r for r in rows
+              if r.get('status') == 'success'
+              and r['name'] in {
+                  'baseline_b2048_s1_start',
+                  'baseline_b2048_s1_end',
+              }
+          ]
+          baseline_control = statistics.median(
+              r['output_throughput_tok_s'] for r in controls
+          ) if controls else None
+          baseline_b5120_s1 = next((
+              r['output_throughput_tok_s'] for r in rows
+              if r.get('status') == 'success'
+              and r['name'] == 'baseline_b5120_s1'
+          ), None)
+          baseline_b5120_s8 = next((
+              r['output_throughput_tok_s'] for r in rows
+              if r.get('status') == 'success'
+              and r['name'] == 'baseline_b5120_s8'
+          ), None)
+          reference = next((
+              r['output_throughput_tok_s'] for r in rows
+              if r.get('status') == 'success'
+              and r['name'] == 'mtp_b2048_pipe1_s1'
+          ), None)
+
+          mtp = [
+              r for r in rows
+              if r.get('status') == 'success' and r.get('speculative')
+              and r['name'] != 'mtp_acceptance_reference'
+          ]
+          for row in mtp:
+              if row['max_num_batched_tokens'] == 5120 and row['stream_interval'] == 8:
+                  paired = baseline_b5120_s8
+              elif row['max_num_batched_tokens'] == 5120:
+                  paired = baseline_b5120_s1
+              else:
+                  paired = baseline_control
+              row['speedup_vs_paired_baseline'] = (
+                  row['output_throughput_tok_s'] / paired if paired else None
+              )
+              row['gain_vs_phase1_best_shape'] = (
+                  row['output_throughput_tok_s'] / reference if reference else None
+              )
+          mtp.sort(key=lambda r: r['output_throughput_tok_s'], reverse=True)
+
+          drift = None
+          start = next((r for r in controls if r['name'].endswith('_start')), None)
+          end = next((r for r in controls if r['name'].endswith('_end')), None)
+          if start and end:
+              drift = (
+                  end['output_throughput_tok_s']
+                  / start['output_throughput_tok_s'] - 1
+              ) * 100
+
+          acceptance = next((
+              r for r in rows
+              if r.get('status') == 'success'
+              and r['name'] == 'mtp_acceptance_reference'
+          ), None)
+
+          def command_text(cmd):
+              try:
+                  return subprocess.check_output(cmd, text=True).strip()
+              except Exception:
+                  return 'unknown'
+
+          summary = {
+              'git_sha': os.environ.get('GITHUB_SHA'),
+              'mlx_lm_ref': os.environ['MLX_LM_REF'],
+              'hardware': {
+                  'platform': platform.platform(),
+                  'cpu': command_text(['sysctl', '-n', 'machdep.cpu.brand_string']),
+                  'memory_bytes': command_text(['sysctl', '-n', 'hw.memsize']),
+              },
+              'workload': {
+                  'requests': int(os.environ['BENCH_REQUESTS']),
+                  'concurrency': int(os.environ['BENCH_CONCURRENCY']),
+                  'prompt_tokens': int(os.environ['BENCH_PROMPT_TOKENS']),
+                  'output_tokens': int(os.environ['BENCH_OUTPUT_TOKENS']),
+              },
+              'baseline_control_output_tok_s': baseline_control,
+              'baseline_drift_percent': drift,
+              'baseline_b5120_s1_output_tok_s': baseline_b5120_s1,
+              'baseline_b5120_s8_output_tok_s': baseline_b5120_s8,
+              'acceptance_reference': acceptance,
+              'best_mtp': mtp[0] if mtp else None,
+              'results': rows,
+          }
+          (root / 'phase2-summary.json').write_text(
+              json.dumps(summary, indent=2, sort_keys=True) + '\n'
+          )
+
+          fields = [
+              'name', 'status', 'output_throughput_tok_s',
+              'total_token_throughput_tok_s', 'speedup_vs_paired_baseline',
+              'gain_vs_phase1_best_shape', 'mean_ttft_ms', 'mean_e2e_ms',
+              'mtp_acceptance_rate', 'max_num_batched_tokens',
+              'decode_pipeline', 'stream_interval', 'prefix_caching',
+              'memory_fraction', 'log_stats', 'error',
+          ]
+          with (root / 'phase2-summary.csv').open('w', newline='') as handle:
+              writer = csv.DictWriter(handle, fieldnames=fields)
+              writer.writeheader()
+              for row in rows:
+                  writer.writerow({key: row.get(key) for key in fields})
+
+          def ratio(value):
+              return 'n/a' if value is None else f'{value:.3f}x'
+
+          def percent(value):
+              return 'n/a' if value is None else f'{value * 100:.1f}%'
+
+          lines = [
+              '# Qwen native MTP focused speed matrix',
+              '',
+              f"- Commit: `{summary['git_sha']}`",
+              f"- mlx-lm: `{summary['mlx_lm_ref']}`",
+              f"- Workload: {summary['workload']}",
+              f"- Baseline control: {baseline_control:.2f} output tok/s" if baseline_control else '- Baseline control: unavailable',
+              f"- Baseline drift: {drift:.2f}%" if drift is not None else '- Baseline drift: unavailable',
+              '',
+              '| Rank | Case | Output tok/s | vs paired baseline | vs b2048/pipeline-on | TTFT ms | E2E ms | Accept | batch | pipeline | stream | prefix | memory |',
+              '|---:|---|---:|---:|---:|---:|---:|---:|---:|:---:|---:|:---:|---:|',
+          ]
+          for rank, row in enumerate(mtp, 1):
+              lines.append(
+                  f"| {rank} | {row['name']} | {row['output_throughput_tok_s']:.2f} | "
+                  f"{ratio(row.get('speedup_vs_paired_baseline'))} | "
+                  f"{ratio(row.get('gain_vs_phase1_best_shape'))} | "
+                  f"{row['mean_ttft_ms']:.1f} | {row['mean_e2e_ms']:.1f} | "
+                  f"{percent(row.get('mtp_acceptance_rate'))} | "
+                  f"{row['max_num_batched_tokens']} | {row['decode_pipeline']} | "
+                  f"{row['stream_interval']} | {row['prefix_caching']} | "
+                  f"{row['memory_fraction']} |"
+              )
+          if acceptance:
+              lines.extend([
+                  '',
+                  '## Acceptance reference',
+                  '',
+                  f"- Draft tokens: {acceptance['mtp_draft_tokens']}",
+                  f"- Accepted tokens: {acceptance['mtp_accepted_tokens']}",
+                  f"- Acceptance rate: {percent(acceptance.get('mtp_acceptance_rate'))}",
+              ])
+          failed = [r for r in rows if r.get('status') != 'success']
+          if failed:
+              lines.extend(['', '## Failed cases', ''])
+              lines.extend(f"- `{r['name']}`: {r.get('error')}" for r in failed)
+          report = '\n'.join(lines) + '\n'
+          (root / 'phase2-summary.md').write_text(report)
+          print(report)
+          if mtp:
+              print('BEST_PHASE2_MTP=' + json.dumps(mtp[0], sort_keys=True))
+          PY
+
+          if [ -f "$RESULT_DIR/phase2-summary.md" ]; then
+            cat "$RESULT_DIR/phase2-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload focused speed-matrix results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-mtp-speed-matrix-phase2
+          path: ${{ env.RESULT_DIR }}
+          if-no-files-found: warn
