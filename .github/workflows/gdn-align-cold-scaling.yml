@@ -1,0 +1,202 @@
+name: GDN Align Cold-Scaling Profile
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [perf/m5max-context-rescue]
+    paths:
+      - .github/workflows/gdn-align-cold-scaling.yml
+      - tools/benchmark/gdn_align_cold_scaling.py
+      - vllm_metal/attention/caches/gdn_cache.py
+      - vllm_metal/attention/impls/gdn_lazy.py
+      - vllm_metal/attention/impls/linear.py
+      - vllm_metal/attention/state/align.py
+      - vllm_metal/attention/runtime/hybrid.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gdn-align-cold-scaling-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  profile:
+    runs-on: macos-15
+    timeout-minutes: 150
+    env:
+      MODEL_DIR: /Users/runner/.cache/vllm-metal-bench/Qwen3.5-0.8B-4bit-mtp
+      MLX_LM_MTP_SHA: ac6aaffd8fdfb8c8e713e17f155d83e3d72b0a0f
+      RESULT_DIR: /tmp/gdn-align-cold-scaling
+      VLLM_METAL_USE_PAGED_ATTENTION: "1"
+      VLLM_METAL_MEMORY_FRACTION: auto
+      VLLM_METAL_GDN_LAZY_KERNELS: "1"
+      VLLM_METAL_DECODE_PIPELINE: "1"
+      VLLM_ENABLE_V1_MULTIPROCESSING: "0"
+      GLOO_SOCKET_IFNAME: lo0
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Cache converted benchmark model
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MODEL_DIR }}
+          key: qwen35-08b-4bit-mtp-${{ runner.os }}-${{ runner.arch }}-${{ env.MLX_LM_MTP_SHA }}
+
+      - name: Install vLLM Metal and exact mlx-lm MTP head
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip uv
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install \
+            'https://github.com/vllm-project/vllm/releases/download/v0.27.1/vllm-0.27.1%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl'
+          VLLM_METAL_BUILD_FROM_SOURCE=1 python -m pip install -e '.[dev]'
+          python -m pip install --force-reinstall --no-deps \
+            "git+https://github.com/PhilipJohnBasile/mlx-lm@${MLX_LM_MTP_SHA}"
+          source scripts/lib.sh
+          ensure_metal_toolchain
+          build_native_artifacts
+          python - <<'PY'
+          import platform
+          import torch
+          print('machine:', platform.machine())
+          print('MPS:', torch.backends.mps.is_available())
+          assert platform.machine() == 'arm64'
+          assert torch.backends.mps.is_available()
+          PY
+
+      - name: Convert Qwen3.5-0.8B
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          rm -rf "$MODEL_DIR"
+          mkdir -p "$(dirname "$MODEL_DIR")"
+          python -m mlx_lm.convert \
+            --hf-path Qwen/Qwen3.5-0.8B \
+            --mlx-path "$MODEL_DIR" \
+            -q --q-bits 4 --q-group-size 64
+
+      - name: Run cache-off and cache-on cold-scaling probes
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          rm -rf "$RESULT_DIR"
+          mkdir -p "$RESULT_DIR"
+          python tools/benchmark/gdn_align_cold_scaling.py \
+            --model "$MODEL_DIR" \
+            --mode off \
+            --output "$RESULT_DIR/cache-off.json" \
+            2>&1 | tee "$RESULT_DIR/cache-off.log"
+          python tools/benchmark/gdn_align_cold_scaling.py \
+            --model "$MODEL_DIR" \
+            --mode on \
+            --output "$RESULT_DIR/cache-on.json" \
+            2>&1 | tee "$RESULT_DIR/cache-on.log"
+
+      - name: Compare scaling and publish summary
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ['RESULT_DIR'])
+          off_path = root / 'cache-off.json'
+          on_path = root / 'cache-on.json'
+          if not off_path.exists() or not on_path.exists():
+              report = '# GDN align cold-scaling profile\n\nProbe stopped before both arms completed.\n'
+              (root / 'summary.md').write_text(report)
+              print(report)
+              raise SystemExit(0)
+
+          off = json.loads(off_path.read_text())
+          on = json.loads(on_path.read_text())
+          off_rows = {row['retained_prompt_target']: row for row in off['results']}
+          on_rows = {row['retained_prompt_target']: row for row in on['results']}
+          rows = []
+          for stage in sorted(off_rows.keys() & on_rows.keys()):
+              a = off_rows[stage]
+              b = on_rows[stage]
+              wall_ratio = b['wall_output_tok_s'] / a['wall_output_tok_s']
+              decode_ratio = None
+              if a.get('decode_tok_s') and b.get('decode_tok_s'):
+                  decode_ratio = b['decode_tok_s'] / a['decode_tok_s']
+              rows.append({
+                  'stage': stage,
+                  'cache_off_wall_tok_s': a['wall_output_tok_s'],
+                  'cache_on_wall_tok_s': b['wall_output_tok_s'],
+                  'wall_ratio': wall_ratio,
+                  'cache_off_decode_tok_s': a.get('decode_tok_s'),
+                  'cache_on_decode_tok_s': b.get('decode_tok_s'),
+                  'decode_ratio': decode_ratio,
+                  'cache_off_ttft_ms': a.get('ttft_ms'),
+                  'cache_on_ttft_ms': b.get('ttft_ms'),
+                  'cache_off_active_bytes': a.get('mlx_active_bytes'),
+                  'cache_on_active_bytes': b.get('mlx_active_bytes'),
+              })
+
+          summary = {
+              'git_sha': os.environ.get('GITHUB_SHA'),
+              'mlx_lm_sha': os.environ['MLX_LM_MTP_SHA'],
+              'cache_off_capacity_events': off['capacity_events'],
+              'cache_on_capacity_events': on['capacity_events'],
+              'rows': rows,
+          }
+          (root / 'summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+
+          def fmt(value, digits=2):
+              return 'n/a' if value is None else f'{value:.{digits}f}'
+
+          lines = [
+              '# GDN align cold-scaling profile',
+              '',
+              '| Retained unique prompts | cache-off wall tok/s | cache-on wall tok/s | on/off | cache-off decode tok/s | cache-on decode tok/s | decode on/off | off TTFT ms | on TTFT ms |',
+              '|---:|---:|---:|---:|---:|---:|---:|---:|---:|',
+          ]
+          for row in rows:
+              lines.append(
+                  f"| {row['stage']} | {fmt(row['cache_off_wall_tok_s'])} | "
+                  f"{fmt(row['cache_on_wall_tok_s'])} | {fmt(row['wall_ratio'], 3)}x | "
+                  f"{fmt(row['cache_off_decode_tok_s'])} | {fmt(row['cache_on_decode_tok_s'])} | "
+                  f"{fmt(row['decode_ratio'], 3)}x | {fmt(row['cache_off_ttft_ms'], 1)} | "
+                  f"{fmt(row['cache_on_ttft_ms'], 1)} |"
+              )
+          lines.extend([
+              '',
+              '## GDN capacity-growth events',
+              '',
+              f"- cache off: `{json.dumps(off['capacity_events'])}`",
+              f"- cache on: `{json.dumps(on['capacity_events'])}`",
+          ])
+          report = '\n'.join(lines) + '\n'
+          (root / 'summary.md').write_text(report)
+          print(report)
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as handle:
+              handle.write(report)
+          PY
+
+      - name: Upload cold-scaling profile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdn-align-cold-scaling
+          path: ${{ env.RESULT_DIR }}
+          if-no-files-found: error
