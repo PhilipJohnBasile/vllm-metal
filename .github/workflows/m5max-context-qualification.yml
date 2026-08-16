@@ -1,0 +1,339 @@
+name: M5 Max Context Qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_path:
+        description: Absolute path to a local Qwen3.5/3.8 MLX checkpoint with MTP weights
+        required: true
+        type: string
+      tokenizer_path:
+        description: Optional tokenizer path; defaults to model_path
+        required: false
+        type: string
+      contexts:
+        description: Comma-separated prompt lengths
+        required: true
+        default: 8192,32768,65536,131072
+        type: string
+      concurrency:
+        description: Comma-separated serving concurrency
+        required: true
+        default: 1,4
+        type: string
+      max_model_len:
+        description: Server maximum model length
+        required: true
+        default: "131328"
+        type: string
+      block_size:
+        description: Resolved scheduler block size for prefix accounting
+        required: true
+        default: "544"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: |
+          python -m py_compile \
+            tools/benchmark/m5max_context_qualification.py \
+            tools/benchmark/m5max_small_m_quantized.py
+
+  qualify:
+    needs: syntax
+    runs-on: [self-hosted, macOS, ARM64, m5max]
+    timeout-minutes: 720
+    env:
+      MODEL_PATH: ${{ inputs.model_path }}
+      TOKENIZER_PATH: ${{ inputs.tokenizer_path }}
+      CONTEXTS: ${{ inputs.contexts }}
+      CONCURRENCY: ${{ inputs.concurrency }}
+      MAX_MODEL_LEN: ${{ inputs.max_model_len }}
+      CACHE_BLOCK_SIZE: ${{ inputs.block_size }}
+      RESULT_DIR: ${{ github.workspace }}/m5max-context-results
+      MLX_LM_REF: ac6aaffd8fdfb8c8e713e17f155d83e3d72b0a0f
+      GLOO_SOCKET_IFNAME: lo0
+      VLLM_ENABLE_V1_MULTIPROCESSING: "0"
+      VLLM_METAL_USE_PAGED_ATTENTION: "1"
+      VLLM_METAL_MEMORY_FRACTION: "0.70"
+      VLLM_METAL_GDN_LAZY_KERNELS: "1"
+      VLLM_METAL_DECODE_PIPELINE: "1"
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Validate local model path
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -f "$MODEL_PATH/config.json"
+          if [ -z "$TOKENIZER_PATH" ]; then
+            echo "TOKENIZER_PATH=$MODEL_PATH" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install current source stack
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip uv
+          python -m pip install \
+            'https://github.com/vllm-project/vllm/releases/download/v0.27.1/vllm-0.27.1%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl'
+          VLLM_METAL_BUILD_FROM_SOURCE=1 python -m pip install -e '.[dev]'
+          python -m pip install --force-reinstall --no-deps \
+            "git+https://github.com/PhilipJohnBasile/mlx-lm@${MLX_LM_REF}"
+          source scripts/lib.sh
+          ensure_metal_toolchain
+          build_native_artifacts
+          python - <<'PY'
+          import json
+          import mlx.core as mx
+          from pathlib import Path
+          from mlx_lm.utils import load
+          import os
+
+          model, _ = load(os.environ['MODEL_PATH'])
+          supports_mtp = bool(getattr(model, 'supports_mtp', False))
+          mtp_entries = len(model.make_mtp_cache()) if supports_mtp else 0
+          record = {
+              'mlx_version': mx.__version__,
+              'device_info': mx.device_info(),
+              'supports_mtp': supports_mtp,
+              'mtp_cache_entries': mtp_entries,
+          }
+          Path('m5max-stack.json').write_text(json.dumps(record, indent=2, default=str) + '\n')
+          assert supports_mtp and mtp_entries
+          PY
+
+      - name: Run serving profiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          rm -rf "$RESULT_DIR"
+          mkdir -p "$RESULT_DIR"
+          SERVER_PID=""
+          PORT=8600
+
+          stop_server() {
+            [ -z "${SERVER_PID:-}" ] && return 0
+            pkill -TERM -P "$SERVER_PID" 2>/dev/null || true
+            kill -TERM "$SERVER_PID" 2>/dev/null || true
+            for _ in $(seq 1 30); do
+              kill -0 "$SERVER_PID" 2>/dev/null || break
+              sleep 1
+            done
+            pkill -KILL -P "$SERVER_PID" 2>/dev/null || true
+            kill -KILL "$SERVER_PID" 2>/dev/null || true
+            wait "$SERVER_PID" 2>/dev/null || true
+            SERVER_PID=""
+          }
+          trap stop_server EXIT INT TERM
+
+          wait_ready() {
+            local port="$1" deadline=$((SECONDS + 900))
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              if curl --connect-timeout 1 --max-time 2 -fsS \
+                "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
+                return 0
+              fi
+              if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+                return 1
+              fi
+              sleep 3
+            done
+            return 1
+          }
+
+          run_profile() {
+            local name="$1" cache="$2" mtp="$3" verify_window="$4"
+            local port="$PORT"
+            PORT=$((PORT + 1))
+            local log="$RESULT_DIR/server-${name}.log"
+            cmd=(
+              vllm serve "$MODEL_PATH"
+              --served-model-name qwen-m5max
+              --host 127.0.0.1
+              --port "$port"
+              --max-model-len "$MAX_MODEL_LEN"
+              --max-num-seqs 8
+              --max-num-batched-tokens 4096
+              --no-async-scheduling
+            )
+            if [ "$cache" = 1 ]; then
+              cmd+=(--enable-prefix-caching)
+            else
+              cmd+=(--no-enable-prefix-caching)
+            fi
+            if [ "$mtp" = 1 ]; then
+              cmd+=(--speculative-config '{"method":"mtp","num_speculative_tokens":1}')
+            fi
+
+            echo "Starting profile $name"
+            VLLM_METAL_SPEC_VERIFY_WINDOW="$verify_window" \
+              "${cmd[@]}" >"$log" 2>&1 &
+            SERVER_PID=$!
+            if ! wait_ready "$port"; then
+              tail -n 300 "$log" || true
+              return 1
+            fi
+
+            python tools/benchmark/m5max_context_qualification.py \
+              --base-url "http://127.0.0.1:${port}" \
+              --model qwen-m5max \
+              --tokenizer "$TOKENIZER_PATH" \
+              --output "$RESULT_DIR/${name}.json" \
+              --contexts "$CONTEXTS" \
+              --concurrency "$CONCURRENCY" \
+              --scenarios cold,exact_repeat,shared_suffix \
+              --output-tokens 128 \
+              --repetitions 2 \
+              --block-size "$CACHE_BLOCK_SIZE" \
+              --profile-name "$name" \
+              2>&1 | tee "$RESULT_DIR/client-${name}.log"
+            stop_server
+            sleep 20
+          }
+
+          run_profile baseline_cache_off 0 0 0
+          run_profile prefix_cache_on 1 0 0
+          run_profile prefix_mtp_default 1 1 0
+          run_profile prefix_mtp_verify_window 1 1 1
+
+      - name: Run small-M quantized operator qualification
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          python tools/benchmark/m5max_small_m_quantized.py \
+            --output "$RESULT_DIR/small-m-quantized.json" \
+            --m-values 1,2,4,8,12,16,32 \
+            --k-values 5120 \
+            --n-values 13824,248320 \
+            --bits 4,8 \
+            --group-size 64 \
+            --warmup 12 \
+            --repetitions 40 \
+            --trials 3 \
+            2>&1 | tee "$RESULT_DIR/small-m-quantized.log"
+
+      - name: Build qualification summary
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import platform
+          import subprocess
+          from pathlib import Path
+
+          root = Path(os.environ['RESULT_DIR'])
+          profile_paths = sorted(
+              path for path in root.glob('*.json')
+              if path.name not in {'small-m-quantized.json', 'summary.json'}
+          )
+          profiles = {}
+          for path in profile_paths:
+              try:
+                  profiles[path.stem] = json.loads(path.read_text())
+              except Exception:
+                  pass
+
+          def sysctl(name):
+              try:
+                  return subprocess.check_output(['sysctl', '-n', name], text=True).strip()
+              except Exception:
+                  return 'unknown'
+
+          rows = []
+          by_profile = {
+              name: {
+                  (row['scenario'], row['context_tokens'], row['concurrency']): row
+                  for row in data.get('results', [])
+              }
+              for name, data in profiles.items()
+          }
+          keys = sorted({key for values in by_profile.values() for key in values})
+          for key in keys:
+              scenario, context, concurrency = key
+              row = {
+                  'scenario': scenario,
+                  'context_tokens': context,
+                  'concurrency': concurrency,
+              }
+              for name, values in by_profile.items():
+                  cell = values.get(key)
+                  if cell:
+                      row[name] = {
+                          'output_tok_s': cell['output_throughput_tok_s'],
+                          'ttft_ms': cell['median_ttft_ms'],
+                          'e2e_ms': cell['median_e2e_ms'],
+                      }
+              rows.append(row)
+
+          summary = {
+              'git_sha': os.environ.get('GITHUB_SHA'),
+              'mlx_lm_ref': os.environ['MLX_LM_REF'],
+              'hardware': {
+                  'platform': platform.platform(),
+                  'cpu': sysctl('machdep.cpu.brand_string'),
+                  'memory_bytes': sysctl('hw.memsize'),
+              },
+              'profiles': profiles,
+              'comparison_rows': rows,
+          }
+          (root / 'summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+
+          names = sorted(profiles)
+          lines = [
+              '# M5 Max long-context qualification',
+              '',
+              f"- CPU: {summary['hardware']['cpu']}",
+              f"- Memory: {summary['hardware']['memory_bytes']} bytes",
+              f"- Commit: `{summary['git_sha']}`",
+              '',
+              '| Scenario | Context | Conc | ' + ' | '.join(f'{name} tok/s' for name in names) + ' |',
+              '|---|---:|---:|' + '|'.join('---:' for _ in names) + '|',
+          ]
+          for row in rows:
+              cells = []
+              for name in names:
+                  cell = row.get(name)
+                  cells.append('n/a' if not cell else f"{cell['output_tok_s']:.2f}")
+              lines.append(
+                  f"| {row['scenario']} | {row['context_tokens']} | {row['concurrency']} | "
+                  + ' | '.join(cells) + ' |'
+              )
+          report = '\n'.join(lines) + '\n'
+          (root / 'summary.md').write_text(report)
+          print(report)
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as handle:
+              handle.write(report)
+          PY
+
+      - name: Upload M5 Max qualification artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m5max-context-qualification
+          path: ${{ env.RESULT_DIR }}
+          if-no-files-found: warn
