@@ -108,6 +108,7 @@ from vllm_metal.v1.proposer import (
     Gemma4MTPProposer,
     MetalProposer,
     ProposeContext,
+    QwenNativeMTPProposer,
 )
 from vllm_metal.v1.sampling_batch import (
     GREEDY_TEMPERATURE_EPS,
@@ -870,6 +871,8 @@ class MetalModelRunner:
             return
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
+        elif spec.method == "mtp":
+            self._drafter = QwenNativeMTPProposer(self)
         elif spec.uses_draft_model():
             from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 
@@ -903,7 +906,7 @@ class MetalModelRunner:
         else:
             raise NotImplementedError(
                 f"Speculative method {spec.method!r} is not supported on Metal "
-                "(supported: Gemma4 MTP, draft_model, ngram)."
+                "(supported: Gemma4/Qwen native MTP, draft_model, ngram)."
             )
 
     def estimate_one_sequence_kv_bytes(
