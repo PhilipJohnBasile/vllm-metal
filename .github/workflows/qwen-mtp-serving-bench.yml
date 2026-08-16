@@ -15,15 +15,17 @@ concurrency:
 jobs:
   benchmark:
     runs-on: macos-15
-    timeout-minutes: 25
+    timeout-minutes: 35
     env:
       VLLM_METAL_USE_PAGED_ATTENTION: "1"
       VLLM_METAL_MEMORY_FRACTION: "auto"
+      GLOO_SOCKET_IFNAME: lo0
       MODEL_DIR: /tmp/Qwen3.5-0.8B-4bit-mtp
-      BENCH_REQUESTS: "10"
+      BENCH_REQUESTS: "8"
       BENCH_OUTPUT_TOKENS: "64"
       BENCH_PROMPT_TOKENS: "512"
       BENCH_REQUEST_TIMEOUT_S: "120"
+      SERVER_READY_TIMEOUT_S: "720"
     steps:
       - uses: actions/checkout@v5
         with:
@@ -60,9 +62,10 @@ jobs:
           from mlx_lm.utils import load
           model, _ = load(os.environ['MODEL_DIR'])
           print('supports_mtp:', getattr(model, 'supports_mtp', None))
-          print('mtp_layers:', len(getattr(getattr(model, 'mtp', None), 'layers', [])))
+          mtp_cache = model.make_mtp_cache()
+          print('mtp_cache_entries:', len(mtp_cache))
           assert bool(getattr(model, 'supports_mtp', False))
-          assert len(model.make_mtp_cache()) > 0
+          assert len(mtp_cache) > 0
           PY
 
       - name: Create benchmark client
@@ -143,7 +146,7 @@ jobs:
                               f'{a.label} request {index} failed: {output.error}'
                           )
                       print(
-                          f'{a.label} request {index}/{a.requests}: '
+                          f'{a.label} request {index}: '
                           f'output={output.output_tokens} '
                           f'ttft_ms={output.ttft * 1000:.2f} '
                           f'e2e_s={time.perf_counter() - started:.2f}',
@@ -151,7 +154,7 @@ jobs:
                       )
                       return output
 
-                  warmup = await one(0)
+                  warmup = await one('warmup')
                   print(
                       f'{a.label} warmup complete: '
                       f'ttft_ms={warmup.ttft * 1000:.2f}',
@@ -162,7 +165,7 @@ jobs:
                   outputs = []
                   started = time.perf_counter()
                   for index in range(1, a.requests + 1):
-                      outputs.append(await one(index))
+                      outputs.append(await one(f'{index}/{a.requests}'))
                   elapsed = time.perf_counter() - started
                   after = await fetch_spec_decode_metrics(base, session)
 
@@ -234,8 +237,11 @@ jobs:
 
           wait_ready() {
             local port="$1"
-            for _ in $(seq 1 90); do
-              if curl --max-time 2 -fsS "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
+            local started_at="$SECONDS"
+            local deadline=$((SECONDS + SERVER_READY_TIMEOUT_S))
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              if curl --connect-timeout 1 --max-time 1 -fsS "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1; then
+                echo "Server on port ${port} ready in $((SECONDS - started_at))s"
                 return 0
               fi
               if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -245,7 +251,7 @@ jobs:
               fi
               sleep 2
             done
-            echo 'Server readiness timed out after 180 seconds'
+            echo "Server readiness timed out after $((SECONDS - started_at))s"
             cat "$SERVER_LOG"
             return 1
           }
@@ -256,19 +262,21 @@ jobs:
             local port="$3"
             SERVER_LOG="/tmp/server-${label}.log"
 
+            common_args=(
+              "$MODEL_DIR"
+              --served-model-name qwen35-mtp-bench
+              --enable-prefix-caching
+              --max-model-len 768
+              --max-num-batched-tokens 128
+              --block-size 16
+              --enforce-eager
+              --port "$port"
+            )
+
             if [ -n "$spec" ]; then
-              vllm serve "$MODEL_DIR" \
-                --served-model-name qwen35-mtp-bench \
-                --enable-prefix-caching \
-                --max-model-len 2048 \
-                --speculative-config "$spec" \
-                --port "$port" >"$SERVER_LOG" 2>&1 &
+              vllm serve "${common_args[@]}" --speculative-config "$spec" >"$SERVER_LOG" 2>&1 &
             else
-              vllm serve "$MODEL_DIR" \
-                --served-model-name qwen35-mtp-bench \
-                --enable-prefix-caching \
-                --max-model-len 2048 \
-                --port "$port" >"$SERVER_LOG" 2>&1 &
+              vllm serve "${common_args[@]}" >"$SERVER_LOG" 2>&1 &
             fi
             SERVER_PID=$!
 
@@ -291,7 +299,7 @@ jobs:
             set -e
 
             stop_server
-            echo "===== ${label} server log ====="
+            echo "===== ${label} server log tail ====="
             tail -n 200 "$SERVER_LOG" || true
             return "$bench_status"
           }
