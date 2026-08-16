@@ -1,0 +1,72 @@
+name: Apply Qwen MTP GDN fast path
+
+on:
+  push:
+    branches: [pr/610-05-paged-qwen-mtp-prefix]
+    paths: [.github/workflows/apply-qwen-mtp-gdn-fastpath.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Apply fast path and syntax-check
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python tools/apply_qwen_mtp_gdn_fastpath.py
+          python -m py_compile \
+            vllm_metal/attention/impls/linear.py \
+            tests/test_gdn_lazy_wrapper.py
+
+      - name: Install test environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install \
+            'https://github.com/vllm-project/vllm/releases/download/v0.27.1/vllm-0.27.1%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl'
+          VLLM_METAL_BUILD_FROM_SOURCE=1 python -m pip install -e '.[dev]'
+          python -m pip install --force-reinstall --no-deps \
+            'git+https://github.com/PhilipJohnBasile/mlx-lm@ac6aaffd8fdfb8c8e713e17f155d83e3d72b0a0f'
+          source scripts/lib.sh
+          ensure_metal_toolchain
+          build_native_artifacts
+
+      - name: Format and test
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          ruff format vllm_metal/attention/impls/linear.py tests/test_gdn_lazy_wrapper.py
+          ruff check vllm_metal/attention/impls/linear.py tests/test_gdn_lazy_wrapper.py
+          pytest -q \
+            tests/test_gdn_lazy_wrapper.py \
+            tests/attention/test_align_gdn_state_manager.py \
+            tests/test_v1_model_runner_generate.py \
+            tests/test_qwen_native_mtp_proposer.py \
+            tests/test_qwen_mtp_paged_cache.py \
+            tests/test_spec_decode_metadata.py
+          git diff --check
+
+      - name: Commit fast path
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'Philip John Basile'
+          git config user.email 'PBasile@Basilecom.com'
+          git add vllm_metal/attention/impls/linear.py tests/test_gdn_lazy_wrapper.py
+          git commit -m 'perf: batch one-draft GDN verification state'
+          git push origin HEAD:pr/610-05-paged-qwen-mtp-prefix
