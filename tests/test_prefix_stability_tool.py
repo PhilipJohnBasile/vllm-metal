@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 
@@ -11,6 +12,7 @@ _TOOL = Path(__file__).parents[1] / "tools" / "prefix_stability.py"
 _SPEC = importlib.util.spec_from_file_location("prefix_stability", _TOOL)
 assert _SPEC is not None and _SPEC.loader is not None
 prefix_stability = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = prefix_stability
 _SPEC.loader.exec_module(prefix_stability)
 
 
