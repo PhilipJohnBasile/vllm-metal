@@ -2,20 +2,21 @@
 """Experimental compact GDN decode-state handoff.
 
 The align-mode hybrid cache stores scheduler-owned checkpoints in arrays indexed
-by scheduler block id.  Ordinary one-token decode previously scattered every
+by scheduler block id. Ordinary one-token decode previously scattered every
 layer's compact state update back into those high-water arrays after every
-step.  MLX represents that indexed write as a new full-array value, so the
-cost grows with the highest resident block id even though only a handful of
-request rows are active.
+step. MLX represents that indexed write as a new full-array value, so the cost
+grows with the highest resident block id even though only a handful of request
+rows are active.
 
 This experiment keeps decode updates compact while the active request/slot
-ordering remains unchanged.  The stable checkpoint pool is flushed only when
-it is actually needed: a block transition, zero-init, scheduler copy, prefix
-restore, speculative state chain, request invalidation, or a completed block
-boundary.
+ordering remains unchanged. The stable checkpoint pool is flushed only when it
+is actually needed: a block transition, zero-init, scheduler copy, prefix
+restore, speculative state chain, or completed block boundary. When a request
+finishes inside a partial block, its compact row is discarded instead of being
+written into a block that automatic prefix caching cannot reuse.
 
 The patch is guarded by ``VLLM_METAL_GDN_DEFER_DECODE_STATE=1`` and is applied
-from the plugin registration path.  It is intentionally isolated here while
+from the plugin registration path. It is intentionally isolated here while
 serving A/Bs qualify the design; once proven, the methods should be folded into
 the owning modules rather than kept as a compatibility patch.
 """
@@ -38,6 +39,7 @@ logger = logging.getLogger(__name__)
 _ENV_NAME = "VLLM_METAL_GDN_DEFER_DECODE_STATE"
 _PATCHED = False
 _ORIGINALS: dict[str, Callable[..., Any]] = {}
+_REQUEST_SLOTS_ATTR = "_deferred_gdn_request_slots"
 
 
 def _enabled() -> bool:
@@ -267,6 +269,29 @@ def _can_skip_initial_pool_flush(
     return True
 
 
+def _record_request_slots(
+    manager: AlignGDNStateManager,
+    req_ids: list[str],
+    ctx: Any,
+) -> None:
+    """Remember each active request's current scheduler slab per GDN group."""
+    mappings = ctx.gdn_group_slot_mappings
+    if mappings is None:
+        return
+    if any(len(group) != len(req_ids) for group in mappings):
+        raise RuntimeError(
+            "deferred GDN request-slot tracking received a malformed mapping"
+        )
+    registry: dict[str, tuple[int, ...]] = getattr(
+        manager, _REQUEST_SLOTS_ATTR, {}
+    )
+    for req_idx, req_id in enumerate(req_ids):
+        registry[req_id] = tuple(
+            int(group[req_idx]) for group in mappings
+        )
+    setattr(manager, _REQUEST_SLOTS_ATTR, registry)
+
+
 def _populate_step_context(
     self: AlignGDNStateManager,
     *,
@@ -303,6 +328,7 @@ def _populate_step_context(
             state_block_ids=state_block_ids,
             step_positions=step_positions,
         )
+        _record_request_slots(self, req_ids, ctx)
         return
 
     # The stock planner's first operation is an unconditional pending-state
@@ -336,6 +362,7 @@ def _populate_step_context(
             cache.__dict__["apply_pending_states"] = previous_override
         else:
             cache.__dict__.pop("apply_pending_states", None)
+    _record_request_slots(self, req_ids, ctx)
 
 
 def _materialize_pending_state(self: AlignGDNStateManager) -> None:
@@ -360,11 +387,113 @@ def _materialize_pending_state(self: AlignGDNStateManager) -> None:
     self._deferred_gdn_flush_after_step = False
 
 
+def _prune_pending_kind(
+    *,
+    states: list[mx.array | None],
+    slot_lists: list[list[int] | None],
+    layer_idx: int,
+    released_slots: set[int],
+) -> bool:
+    """Remove released request rows from one compact per-layer state value."""
+    state = states[layer_idx]
+    slots = slot_lists[layer_idx]
+    if state is None:
+        return slots is None
+    if slots is None or len(slots) != state.shape[0]:
+        return False
+
+    keep_indices = [
+        index for index, slot in enumerate(slots) if slot not in released_slots
+    ]
+    if len(keep_indices) == len(slots):
+        return True
+    if not keep_indices:
+        states[layer_idx] = None
+        slot_lists[layer_idx] = None
+        return True
+
+    keep = mx.array(keep_indices, dtype=mx.int32)
+    states[layer_idx] = state[keep]
+    slot_lists[layer_idx] = [slots[index] for index in keep_indices]
+    return True
+
+
+def _prune_released_pending_rows(
+    manager: AlignGDNStateManager,
+    released_by_group: dict[int, set[int]],
+) -> bool:
+    """Discard non-cacheable compact rows without touching stable pools."""
+    cache = manager._state_cache
+    for group, released_slots in released_by_group.items():
+        if not released_slots:
+            continue
+        for layer_idx in cache.layers_for_group_ordinal(group):
+            conv_ok = _prune_pending_kind(
+                states=cache.pending_conv_states,
+                slot_lists=cache.pending_conv_slot_ids,
+                layer_idx=layer_idx,
+                released_slots=released_slots,
+            )
+            recurrent_ok = _prune_pending_kind(
+                states=cache.pending_recurrent_states,
+                slot_lists=cache.pending_recurrent_slot_ids,
+                layer_idx=layer_idx,
+                released_slots=released_slots,
+            )
+            if not (conv_ok and recurrent_ok):
+                return False
+    return True
+
+
 def _release_requests(self: AlignGDNStateManager, req_ids: set[str]) -> None:
-    if _enabled() and req_ids:
-        # A request can disappear or its scheduler blocks can be recycled before
-        # the next ordinary state-motion step. Force one stable-pool handoff.
+    """Drop released partial-block rows; preserve shared/active compact rows."""
+    if not _enabled() or not req_ids:
+        _ORIGINALS["align_release_requests"](self, req_ids)
+        return
+
+    registry: dict[str, tuple[int, ...]] = getattr(
+        self, _REQUEST_SLOTS_ATTR, {}
+    )
+    released_mappings: list[tuple[int, ...]] = []
+    missing_mapping = False
+    for req_id in req_ids:
+        mapping = registry.pop(req_id, None)
+        if mapping is None:
+            missing_mapping = True
+        else:
+            released_mappings.append(mapping)
+    setattr(self, _REQUEST_SLOTS_ATTR, registry)
+
+    if released_mappings:
+        num_groups = len(released_mappings[0])
+        if any(len(mapping) != num_groups for mapping in released_mappings):
+            missing_mapping = True
+        elif any(len(mapping) != num_groups for mapping in registry.values()):
+            missing_mapping = True
+        else:
+            # Numeric block ids can overlap across scheduler groups, so prune
+            # each group's layers independently. Do not remove a slot still
+            # owned by another active request.
+            remaining_by_group = {
+                group: {mapping[group] for mapping in registry.values()}
+                for group in range(num_groups)
+            }
+            released_by_group = {
+                group: {
+                    mapping[group] for mapping in released_mappings
+                }
+                - remaining_by_group[group]
+                for group in range(num_groups)
+            }
+            if not _prune_released_pending_rows(self, released_by_group):
+                missing_mapping = True
+
+    if missing_mapping:
+        # Unknown ownership is rare (for example lifecycle invalidation before
+        # the request has ever reached a GDN forward). Retain the old safe
+        # fallback instead of guessing which compact row may be recycled.
         self._deferred_gdn_force_flush = True
+
     _ORIGINALS["align_release_requests"](self, req_ids)
 
 
