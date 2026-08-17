@@ -7,6 +7,7 @@ on:
     paths:
       - .github/workflows/qwen-mtp-combo-smoke.yml
       - benchmarks/qwen_mtp_combo_smoke.py
+      - benchmarks/qwen_mtp_combo_smoke_listener.py
       - benchmarks/patches/qwen_mtp_copyless_gdn.patch
       - vllm_metal/__init__.py
       - vllm_metal/experimental/gdn_copyless_deferred_compat.py
@@ -50,6 +51,7 @@ jobs:
         with:
           path: ${{ env.MODEL_DIR }}
           key: qwen35-08b-4bit-mtp-breakthrough-${{ runner.os }}-${{ runner.arch }}-${{ env.MLX_LM_MTP_SHA }}
+          save-always: true
 
       - name: Install vLLM Metal and exact mlx-lm MTP head
         shell: bash
@@ -87,6 +89,7 @@ jobs:
           source .venv/bin/activate
           python -m py_compile \
             benchmarks/qwen_mtp_combo_smoke.py \
+            benchmarks/qwen_mtp_combo_smoke_listener.py \
             vllm_metal/__init__.py \
             vllm_metal/experimental/gdn_copyless_deferred_compat.py \
             vllm_metal/experimental/gdn_deferred_decode_state.py \
@@ -116,7 +119,7 @@ jobs:
           source .venv/bin/activate
           rm -rf "$RESULT_DIR"
           mkdir -p "$RESULT_DIR"
-          python benchmarks/qwen_mtp_combo_smoke.py \
+          python benchmarks/qwen_mtp_combo_smoke_listener.py \
             --model-dir "$MODEL_DIR" \
             --output-dir "$RESULT_DIR" \
             --launch-repeats 1 \
