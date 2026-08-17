@@ -5,7 +5,7 @@ on:
     branches: [debug/qwen36-mtp-c4-routing]
     paths:
       - .github/workflows/qwen36-mtp-c4-routing-ab-validation.yml
-      - tools/qwen36-mtp-c4-routing-ab/source.zip.b64
+      - tools/qwen36-mtp-c4-routing-ab/source.part-*.b64
   workflow_dispatch:
 
 permissions:
@@ -32,7 +32,9 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          base64 -d tools/qwen36-mtp-c4-routing-ab/source.zip.b64 \
+          cat tools/qwen36-mtp-c4-routing-ab/source.part-*.b64 \
+            > /tmp/qwen36-mtp-c4-routing-ab-source.zip.b64
+          base64 -d /tmp/qwen36-mtp-c4-routing-ab-source.zip.b64 \
             > /tmp/qwen36-mtp-c4-routing-ab-source.zip
           echo \
             '878a556c5c411eed42a734be832312ee8f1f60f05af5ad751e6b72d6844ac58a  /tmp/qwen36-mtp-c4-routing-ab-source.zip' \
