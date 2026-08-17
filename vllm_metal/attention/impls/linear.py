@@ -363,20 +363,30 @@ class GDNPagedAttentionWrapper(nn.Module):
         # rollback slots. Seed the speculative slots from that state, then
         # advance every draft token together. This matches mlx-lm's
         # n_confirmed=1 rollback semantics without per-request Python loops.
-        cache_idx = self._gdn_cache_idx
-        pool = self._gdn_state_cache.conv_states[cache_idx]
-        src = mx.array(rollback_slots, dtype=mx.int32)
-        dst = mx.array(speculative_slots, dtype=mx.int32)
-        pool[dst] = pool[src]
-        self._gdn_state_cache.store_conv_state(cache_idx, pool)
-
-        second = self._gdn_lazy.try_conv_decode(
-            mixed_qkv[:, 1::2, :],
-            self._inner,
-            self._gdn_state_cache,
-            cache_idx,
-            speculative_slots,
-        )
+        if isinstance(self._gdn_lazy, GDNLazyKernels):
+            second = self._gdn_lazy.try_conv_decode(
+                mixed_qkv[:, 1::2, :],
+                self._inner,
+                self._gdn_state_cache,
+                self._gdn_cache_idx,
+                rollback_slots,
+                write_slot_ids=speculative_slots,
+            )
+        else:
+            # Preserve the old shape for test doubles and external wrappers.
+            cache_idx = self._gdn_cache_idx
+            pool = self._gdn_state_cache.conv_states[cache_idx]
+            src = mx.array(rollback_slots, dtype=mx.int32)
+            dst = mx.array(speculative_slots, dtype=mx.int32)
+            pool[dst] = pool[src]
+            self._gdn_state_cache.store_conv_state(cache_idx, pool)
+            second = self._gdn_lazy.try_conv_decode(
+                mixed_qkv[:, 1::2, :],
+                self._inner,
+                self._gdn_state_cache,
+                cache_idx,
+                speculative_slots,
+            )
         if second is None:
             raise RuntimeError(
                 "one-draft GDN conv fast path became ineligible mid-step"
@@ -535,7 +545,11 @@ class GDNPagedAttentionWrapper(nn.Module):
             return None
         rollback_slots, speculative_slots = slots
 
-        def request(rows: slice, slot_ids: list[int]) -> GDNRecurrentDecodeRequest:
+        def request(
+            rows: slice,
+            slot_ids: list[int],
+            write_slot_ids: list[int] | None = None,
+        ) -> GDNRecurrentDecodeRequest:
             return GDNRecurrentDecodeRequest(
                 q=q[:, rows],
                 k=k[:, rows],
@@ -547,6 +561,7 @@ class GDNPagedAttentionWrapper(nn.Module):
                 slot_ids=slot_ids,
                 output_dtype=state.x.dtype,
                 threadgroup_dv=self._recurrent_decode_threadgroup_dv(),
+                write_slot_ids=write_slot_ids,
             )
 
         first = self._gdn_lazy.try_recurrent_decode(
@@ -555,16 +570,25 @@ class GDNPagedAttentionWrapper(nn.Module):
         if first is None:
             return None
 
-        cache_idx = self._gdn_cache_idx
-        pool = self._gdn_state_cache.recurrent_states[cache_idx]
-        src = mx.array(rollback_slots, dtype=mx.int32)
-        dst = mx.array(speculative_slots, dtype=mx.int32)
-        pool[dst] = pool[src]
-        self._gdn_state_cache.store_recurrent_state(cache_idx, pool)
-
-        second = self._gdn_lazy.try_recurrent_decode(
-            request(slice(1, None, 2), speculative_slots)
-        )
+        if isinstance(self._gdn_lazy, GDNLazyKernels):
+            second = self._gdn_lazy.try_recurrent_decode(
+                request(
+                    slice(1, None, 2),
+                    rollback_slots,
+                    write_slot_ids=speculative_slots,
+                )
+            )
+        else:
+            # Preserve the old shape for test doubles and external wrappers.
+            cache_idx = self._gdn_cache_idx
+            pool = self._gdn_state_cache.recurrent_states[cache_idx]
+            src = mx.array(rollback_slots, dtype=mx.int32)
+            dst = mx.array(speculative_slots, dtype=mx.int32)
+            pool[dst] = pool[src]
+            self._gdn_state_cache.store_recurrent_state(cache_idx, pool)
+            second = self._gdn_lazy.try_recurrent_decode(
+                request(slice(1, None, 2), speculative_slots)
+            )
         if second is None:
             raise RuntimeError(
                 "one-draft GDN recurrent fast path became ineligible mid-step"
