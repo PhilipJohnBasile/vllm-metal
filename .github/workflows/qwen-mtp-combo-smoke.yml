@@ -110,9 +110,11 @@ jobs:
           git diff --check
           test -z "$(git status --short)"
 
-      - name: Run one-launch four-arm smoke ladder
+      - name: Run three-launch copyless vs combined promotion gate
         id: ladder
         continue-on-error: true
+        env:
+          QWEN_MTP_SMOKE_ARMS: mtp_copyless,mtp_combo
         shell: bash
         run: |
           set -euxo pipefail
@@ -122,31 +124,31 @@ jobs:
           python benchmarks/qwen_mtp_combo_smoke_listener.py \
             --model-dir "$MODEL_DIR" \
             --output-dir "$RESULT_DIR" \
-            --launch-repeats 1 \
+            --launch-repeats 3 \
             --prompt-tokens 1152 \
-            --output-tokens 32 \
+            --output-tokens 64 \
             --warmup-tokens 8 \
             --request-timeout-s 240 \
             --server-ready-timeout-s 720 \
             2>&1 | tee "$RESULT_DIR/run.log"
 
-      - name: Publish smoke summary
+      - name: Publish promotion summary
         if: always()
         shell: bash
         run: |
           if [ -f "$RESULT_DIR/summary.md" ]; then
             cat "$RESULT_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo '# Qwen MTP combined-state smoke' >> "$GITHUB_STEP_SUMMARY"
+            echo '# Qwen MTP combined-state promotion gate' >> "$GITHUB_STEP_SUMMARY"
             echo 'The run stopped before producing a summary.' >> "$GITHUB_STEP_SUMMARY"
           fi
           git status --short | tee "$RESULT_DIR/git-status.txt"
 
-      - name: Upload smoke diagnostics
+      - name: Upload promotion diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: qwen-mtp-combo-smoke
+          name: qwen-mtp-combo-promotion
           path: ${{ env.RESULT_DIR }}
           if-no-files-found: error
 
@@ -154,5 +156,5 @@ jobs:
         if: steps.ladder.outcome == 'failure'
         shell: bash
         run: |
-          echo 'The four-arm smoke ladder did not pass its functional gate.' >&2
+          echo 'The copyless-vs-combined promotion run did not pass its functional gate.' >&2
           exit 1
