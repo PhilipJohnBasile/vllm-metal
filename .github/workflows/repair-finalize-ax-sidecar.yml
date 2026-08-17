@@ -1,0 +1,54 @@
+name: Repair AX sidecar finalizer
+
+on:
+  push:
+    branches:
+      - bench/m5max-qwen36-final-qualification
+    paths:
+      - .github/workflows/repair-finalize-ax-sidecar.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Replace nested heredoc and self-remove
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path(".github/workflows/finalize-ax-sidecar-adoption.yml")
+          source = path.read_text()
+          old = (
+              '      AX_SOURCE_DIR="$(AX_REPO="$AX_REPO" python - <<\'PY\'\n'
+              'import os\n'
+              'from huggingface_hub import snapshot_download\n'
+              '\n'
+              'print(snapshot_download(repo_id=os.environ["AX_REPO"]))\n'
+              + 'P' + 'Y\n'
+              ')"\n'
+          )
+          new = (
+              '      AX_SOURCE_DIR="$(AX_REPO="$AX_REPO" python -c '
+              '\'import os; from huggingface_hub import snapshot_download; '
+              'print(snapshot_download(repo_id=os.environ["AX_REPO"]))\')"\n'
+          )
+          if source.count(old) != 1:
+              raise SystemExit(f"expected one nested heredoc, found {source.count(old)}")
+          path.write_text(source.replace(old, new, 1))
+          PY
+          rm .github/workflows/repair-finalize-ax-sidecar.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/workflows/finalize-ax-sidecar-adoption.yml \
+            .github/workflows/repair-finalize-ax-sidecar.yml
+          git commit -m 'ci: repair AX sidecar finalizer quoting'
+          git push origin HEAD:bench/m5max-qwen36-final-qualification
