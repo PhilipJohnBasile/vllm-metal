@@ -22,10 +22,21 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Format, lint, and validate
+      - name: Repair, format, lint, and validate
         shell: bash
         run: |
           set -euxo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("benchmarks/qwen_mtp_m5max_qualification.py")
+          source = path.read_text()
+          old = "for index, output in zip(indices, wave):"
+          new = "for index, output in zip(indices, wave, strict=True):"
+          if old not in source and new not in source:
+              raise SystemExit("expected zip collector was not found")
+          path.write_text(source.replace(old, new))
+          PY
           python -m pip install 'ruff==0.16.0'
           ruff check --fix benchmarks/qwen_mtp_m5max_qualification.py
           ruff format benchmarks/qwen_mtp_m5max_qualification.py
@@ -46,8 +57,5 @@ jobs:
             scripts/run_m5max_qwen36_qualification.sh \
             benchmarks/M5MAX_QWEN36_QUALIFICATION.md \
             .github/workflows/finalize-m5max-qwen36-harness.yml
-          if git diff --cached --quiet; then
-            exit 0
-          fi
           git commit -m 'bench: finalize physical M5 Max Qwen3.6 qualification harness'
           git push origin HEAD:bench/m5max-qwen36-final-qualification
