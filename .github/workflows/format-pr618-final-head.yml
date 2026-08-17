@@ -1,0 +1,51 @@
+name: Format final PR 618 head
+
+on:
+  push:
+    branches: [repair/pr618-format]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: format-pr618-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Format the two failing files
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install 'ruff==0.16.0'
+          ruff format \
+            benchmarks/qwen_mtp_speed_matrix.py \
+            tests/test_qwen_mtp_wrapper_metadata.py
+          ruff check .
+          ruff format --check .
+          git diff --check
+
+      - name: Commit only the formatted source files
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git rm .github/workflows/format-pr618-final-head.yml
+          git add \
+            benchmarks/qwen_mtp_speed_matrix.py \
+            tests/test_qwen_mtp_wrapper_metadata.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Format Qwen MTP benchmark and metadata tests'
+          git push origin HEAD:repair/pr618-format
