@@ -143,7 +143,12 @@ def _register() -> str | None:
             apply_deferred_gdn_state_patch,
         )
 
-        apply_deferred_gdn_state_patch()
+        if apply_deferred_gdn_state_patch():
+            from vllm_metal.experimental.gdn_copyless_deferred_compat import (
+                apply_copyless_deferred_gdn_compat_patch,
+            )
+
+            apply_copyless_deferred_gdn_compat_patch()
 
     if os.getenv("VLLM_METAL_GDN_PREALLOCATE_CHECKPOINTS", "0") == "1":
         from vllm_metal.experimental.gdn_preallocate_probe import (

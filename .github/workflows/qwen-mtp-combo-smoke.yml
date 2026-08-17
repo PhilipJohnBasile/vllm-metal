@@ -1,0 +1,155 @@
+name: Qwen MTP Combined-State Smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [debug/qwen-mtp-combo-smoke]
+    paths:
+      - .github/workflows/qwen-mtp-combo-smoke.yml
+      - benchmarks/qwen_mtp_combo_smoke.py
+      - benchmarks/patches/qwen_mtp_copyless_gdn.patch
+      - vllm_metal/__init__.py
+      - vllm_metal/experimental/gdn_copyless_deferred_compat.py
+      - vllm_metal/experimental/gdn_deferred_decode_state.py
+      - tests/test_gdn_copyless_deferred_compat.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qwen-mtp-combo-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MODEL_DIR: /Users/runner/.cache/vllm-metal-bench/Qwen3.5-0.8B-4bit-mtp
+  RESULT_DIR: /tmp/qwen-mtp-combo-smoke
+  MLX_LM_MTP_SHA: ac6aaffd8fdfb8c8e713e17f155d83e3d72b0a0f
+  GLOO_SOCKET_IFNAME: lo0
+  VLLM_METAL_USE_PAGED_ATTENTION: "1"
+  VLLM_METAL_MEMORY_FRACTION: auto
+
+jobs:
+  smoke:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Cache converted benchmark model
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MODEL_DIR }}
+          key: qwen35-08b-4bit-mtp-breakthrough-${{ runner.os }}-${{ runner.arch }}-${{ env.MLX_LM_MTP_SHA }}
+
+      - name: Install vLLM Metal and exact mlx-lm MTP head
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip uv
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install \
+            'https://github.com/vllm-project/vllm/releases/download/v0.27.1/vllm-0.27.1%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl'
+          VLLM_METAL_BUILD_FROM_SOURCE=1 python -m pip install -e '.[dev]'
+          python -m pip install --force-reinstall --no-deps \
+            "git+https://github.com/PhilipJohnBasile/mlx-lm@${MLX_LM_MTP_SHA}"
+          source scripts/lib.sh
+          ensure_metal_toolchain
+          build_native_artifacts
+
+      - name: Convert Qwen3.5-0.8B with MTP weights
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          rm -rf "$MODEL_DIR"
+          mkdir -p "$(dirname "$MODEL_DIR")"
+          python -m mlx_lm.convert \
+            --hf-path Qwen/Qwen3.5-0.8B \
+            --mlx-path "$MODEL_DIR" \
+            -q --q-bits 4 --q-group-size 64
+
+      - name: Validate combined copyless and deferred contracts
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          python -m py_compile \
+            benchmarks/qwen_mtp_combo_smoke.py \
+            vllm_metal/__init__.py \
+            vllm_metal/experimental/gdn_copyless_deferred_compat.py \
+            vllm_metal/experimental/gdn_deferred_decode_state.py \
+            tests/test_gdn_copyless_deferred_compat.py
+          git apply --check --whitespace=nowarn \
+            benchmarks/patches/qwen_mtp_copyless_gdn.patch
+          git apply --whitespace=nowarn \
+            benchmarks/patches/qwen_mtp_copyless_gdn.patch
+          pytest -q \
+            tests/test_gdn_copyless_deferred_compat.py \
+            tests/test_gdn_deferred_decode_state.py \
+            tests/test_gdn_lazy_wrapper.py \
+            tests/attention/test_align_gdn_state_manager.py
+          git apply --reverse --check --whitespace=nowarn \
+            benchmarks/patches/qwen_mtp_copyless_gdn.patch
+          git apply --reverse --whitespace=nowarn \
+            benchmarks/patches/qwen_mtp_copyless_gdn.patch
+          git diff --check
+          test -z "$(git status --short)"
+
+      - name: Run one-launch four-arm smoke ladder
+        id: ladder
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          rm -rf "$RESULT_DIR"
+          mkdir -p "$RESULT_DIR"
+          python benchmarks/qwen_mtp_combo_smoke.py \
+            --model-dir "$MODEL_DIR" \
+            --output-dir "$RESULT_DIR" \
+            --launch-repeats 1 \
+            --prompt-tokens 1152 \
+            --output-tokens 32 \
+            --warmup-tokens 8 \
+            --request-timeout-s 240 \
+            --server-ready-timeout-s 720 \
+            2>&1 | tee "$RESULT_DIR/run.log"
+
+      - name: Publish smoke summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RESULT_DIR/summary.md" ]; then
+            cat "$RESULT_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '# Qwen MTP combined-state smoke' >> "$GITHUB_STEP_SUMMARY"
+            echo 'The run stopped before producing a summary.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          git status --short | tee "$RESULT_DIR/git-status.txt"
+
+      - name: Upload smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-mtp-combo-smoke
+          path: ${{ env.RESULT_DIR }}
+          if-no-files-found: error
+
+      - name: Fail on functional or lifecycle failure
+        if: steps.ladder.outcome == 'failure'
+        shell: bash
+        run: |
+          echo 'The four-arm smoke ladder did not pass its functional gate.' >&2
+          exit 1
