@@ -46,14 +46,18 @@ jobs:
           ensure_metal_toolchain
           build_native_artifacts
 
-      - name: Apply copyless destination-state patch
+      - name: Apply and format copyless destination-state patch
         shell: bash
         run: |
           set -euxo pipefail
+          source .venv/bin/activate
           git apply --check --whitespace=nowarn \
             benchmarks/patches/qwen_mtp_copyless_gdn.patch
           git apply --whitespace=nowarn \
             benchmarks/patches/qwen_mtp_copyless_gdn.patch
+          ruff format \
+            vllm_metal/attention/impls/gdn_lazy.py \
+            vllm_metal/attention/impls/linear.py
           python -m py_compile \
             vllm_metal/attention/impls/gdn_lazy.py \
             vllm_metal/attention/impls/linear.py
