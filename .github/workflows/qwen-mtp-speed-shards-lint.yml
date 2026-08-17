@@ -1,0 +1,92 @@
+name: Validate Qwen MTP Speed Shards
+
+on:
+  push:
+    branches:
+      - bench/qwen-mtp-speed-shards
+    paths:
+      - .github/workflows/qwen-mtp-speed-matrix-shards.yml
+      - .github/workflows/qwen-mtp-speed-shards-lint.yml
+      - benchmarks/qwen_mtp_speed_matrix.py
+      - benchmarks/qwen_mtp_speed_matrix_shard.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Compile benchmark scripts
+        run: |
+          python -m py_compile \
+            benchmarks/qwen_mtp_speed_matrix.py \
+            benchmarks/qwen_mtp_speed_matrix_shard.py
+
+      - name: Validate shard coverage and controls
+        run: |
+          python - <<'PY'
+          import ast
+          import re
+          from pathlib import Path
+
+          benchmark = Path('benchmarks/qwen_mtp_speed_matrix.py').read_text()
+          workflow = Path('.github/workflows/qwen-mtp-speed-matrix-shards.yml').read_text()
+
+          tree = ast.parse(benchmark)
+          profile_names = set()
+          for node in ast.walk(tree):
+              if not isinstance(node, ast.Call):
+                  continue
+              if not isinstance(node.func, ast.Name) or node.func.id != 'Profile':
+                  continue
+              if node.args and isinstance(node.args[0], ast.Constant):
+                  profile_names.add(str(node.args[0].value))
+
+          expected = {
+              'baseline_ref',
+              'mtp_safe',
+              'mtp_batch1024',
+              'mtp_batch2048',
+              'mtp_batch4096',
+              'mtp_block32',
+              'mtp_verify_window',
+              'mtp_no_decode_pipeline',
+              'mtp_gdn_fallback',
+              'baseline_repeat',
+          }
+          if profile_names != expected:
+              raise SystemExit(
+                  f'profile mismatch: missing={sorted(expected-profile_names)} '
+                  f'extra={sorted(profile_names-expected)}'
+              )
+
+          shards = re.findall(r'^\s+profiles:\s*([^\n]+)$', workflow, re.MULTILINE)
+          if len(shards) != 4:
+              raise SystemExit(f'expected 4 shards, found {len(shards)}')
+
+          seen_mtp = []
+          for index, raw in enumerate(shards, 1):
+              names = [name.strip() for name in raw.split(',') if name.strip()]
+              for control in ('baseline_ref', 'baseline_repeat'):
+                  if control not in names:
+                      raise SystemExit(f'shard {index} missing {control}')
+              seen_mtp.extend(name for name in names if name.startswith('mtp_'))
+
+          expected_mtp = sorted(name for name in expected if name.startswith('mtp_'))
+          if sorted(seen_mtp) != expected_mtp:
+              raise SystemExit(
+                  f'MTP shard coverage mismatch: got={sorted(seen_mtp)} '
+                  f'expected={expected_mtp}'
+              )
+
+          print('Validated 4 shards, matched controls, and complete MTP profile coverage.')
+          PY
