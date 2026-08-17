@@ -30,9 +30,12 @@ sidecar, so those directories are not accepted unchanged by this gate.
 
 The sidecar has now been independently inspected: its 15 BF16 tensors use the
 exact native `mlx-lm#1740` names, dtypes, shapes, and contiguous byte spans. The
-preferred fast path is therefore a fail-closed index adoption, not a tensor rewrite.
-The adopter verifies the AX provenance manifest and full sidecar SHA-256 before it
-creates a separate model directory. Official conversion remains the clean fallback.
+preferred fast path is therefore a fail-closed adoption, not a tensor rewrite.
+MLX-LM discovers local weights with `model*.safetensors`, so the adopter exposes the
+verified bytes as `model-mtp.safetensors`, writes a matching index, and records the
+alias in `native_mtp_adoption.json`. It verifies the AX provenance manifest and full
+sidecar SHA-256 before the separate model directory becomes visible. Official
+conversion remains the clean fallback.
 
 ## One-command run
 

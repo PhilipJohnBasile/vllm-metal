@@ -5,8 +5,9 @@ The AutomatosX package stores a native-MLX-compatible ``mtp.safetensors``
 next to a five-shard 6-bit target model, but its ordinary weight index does not
 reference the sidecar. Standard MLX-LM therefore never opens it. This helper
 creates a separate model directory, links or copies the immutable package
-files, validates the exact 15-tensor native-MTP contract, and atomically writes
-an index that admits the sidecar.
+files, validates the exact 15-tensor native-MTP contract, exposes the verified
+sidecar under MLX-LM's ``model*.safetensors`` discovery rule, and atomically
+writes a matching index.
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ MUTABLE_NAMES = {
 }
 SKIP_ROOTS = {".git", ".cache"}
 MLX_LM_MTP_HEAD = "a9fd7ef1032419a584ead9a38bdb66635f2d85c3"
+LOADER_SIDECAR_NAME = "model-mtp.safetensors"
 
 
 def parse_args() -> argparse.Namespace:
@@ -328,11 +330,23 @@ def build_adopted_model(
     stage_dir.mkdir()
     try:
         methods = mirror_source(source_dir, stage_dir, link_mode)
+        loader_sidecar_path = stage_dir / LOADER_SIDECAR_NAME
+        if loader_sidecar_path.exists():
+            raise RuntimeError(
+                f"loader sidecar alias already exists: {loader_sidecar_path}"
+            )
+        alias_method = materialize_file(
+            source_dir / "mtp.safetensors",
+            loader_sidecar_path,
+            link_mode,
+        )
+        methods[f"{alias_method}-mtp-loader-alias"] += 1
+
         index_path = stage_dir / "model.safetensors.index.json"
         index = read_json(index_path)
         weight_map = index["weight_map"]
         for key in sorted(EXPECTED_TENSORS):
-            weight_map[key] = "mtp.safetensors"
+            weight_map[key] = LOADER_SIDECAR_NAME
 
         metadata = index.get("metadata")
         if not isinstance(metadata, dict):
@@ -362,6 +376,7 @@ def build_adopted_model(
             "source_index_sha256": source_contract["source_index_sha256"],
             "source_manifest_sha256": source_contract["source_manifest_sha256"],
             "sidecar_sha256": source_contract["sidecar_sha256"],
+            "loader_sidecar_name": LOADER_SIDECAR_NAME,
             "sidecar_file_bytes": source_contract["sidecar_file_bytes"],
             "sidecar_data_bytes": source_contract["sidecar_data_bytes"],
             "sidecar_parameter_count": source_contract["sidecar_parameter_count"],
@@ -374,10 +389,10 @@ def build_adopted_model(
         # Re-read the staged result before making it visible.
         staged_index = read_json(index_path)
         staged_map = staged_index.get("weight_map", {})
-        if any(staged_map.get(key) != "mtp.safetensors" for key in EXPECTED_TENSORS):
+        if any(staged_map.get(key) != LOADER_SIDECAR_NAME for key in EXPECTED_TENSORS):
             raise RuntimeError("staged index failed its MTP mapping verification")
-        if sha256_file(stage_dir / "mtp.safetensors") != receipt["sidecar_sha256"]:
-            raise RuntimeError("staged sidecar digest changed during materialization")
+        if sha256_file(loader_sidecar_path) != receipt["sidecar_sha256"]:
+            raise RuntimeError("loader-visible sidecar digest changed")
         os.replace(stage_dir, output_dir)
     except BaseException:
         shutil.rmtree(stage_dir, ignore_errors=True)
