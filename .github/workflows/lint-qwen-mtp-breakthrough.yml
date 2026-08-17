@@ -1,0 +1,28 @@
+name: Lint Qwen MTP Breakthrough Workflow
+
+on:
+  push:
+    branches:
+      - perf/qwen-mtp-breakthrough-matrix
+    paths:
+      - .github/workflows/lint-qwen-mtp-breakthrough.yml
+      - .github/workflows/qwen-mtp-breakthrough-matrix.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+          cache: false
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Lint breakthrough workflow
+        run: "$(go env GOPATH)/bin/actionlint .github/workflows/qwen-mtp-breakthrough-matrix.yml"
