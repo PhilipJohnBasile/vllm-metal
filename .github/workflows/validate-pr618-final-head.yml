@@ -1,0 +1,146 @@
+name: Validate final rebased PR 618 head
+
+on:
+  push:
+    branches: [validation/pr618-full]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-pr618-final-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PR_HEAD_SHA: bf59b7c4d912f3aca5f8217b0da1bfd1ed260294
+  MLX_LM_MTP_SHA: a9fd7ef1032419a584ead9a38bdb66635f2d85c3
+  RESULT_DIR: /tmp/pr618-final-validation
+
+jobs:
+  validate:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install final source stack and build Metal artifacts
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip uv
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install \
+            'https://github.com/vllm-project/vllm/releases/download/v0.27.1/vllm-0.27.1%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl'
+          VLLM_METAL_BUILD_FROM_SOURCE=1 python -m pip install -e '.[dev]'
+          python -m pip install --force-reinstall --no-deps \
+            "git+https://github.com/PhilipJohnBasile/mlx-lm@${MLX_LM_MTP_SHA}"
+          source scripts/lib.sh
+          ensure_metal_toolchain
+          build_native_artifacts
+          python - <<'PY'
+          from vllm_metal.metal.build import METALLIB_NAMES, metallib_path, output_path
+
+          extension = output_path()
+          assert extension.is_file(), extension
+          for name in METALLIB_NAMES:
+              library = metallib_path(name)
+              assert library.is_file(), library
+          print(f"Native extension ready: {extension}")
+          PY
+
+      - name: Verify raw MPS and MLX-to-PyTorch bridge
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          unset PYTORCH_MPS_HIGH_WATERMARK_RATIO
+          python - <<'PY'
+          import platform
+          import torch
+
+          assert platform.machine() == "arm64"
+          assert torch.backends.mps.is_built(), "PyTorch was not built with MPS"
+          assert torch.backends.mps.is_available(), "MPS is not available"
+          tensor = torch.tensor([1.0, 2.0, 3.0], device="mps")
+          torch.mps.synchronize()
+          assert tensor.device.type == "mps"
+          print("Raw PyTorch MPS allocation passed")
+          PY
+          python - <<'PY'
+          import mlx.core as mx
+          import torch
+
+          from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+
+          source = mx.array([1.0, 2.0, 3.0], dtype=mx.float32)
+          mx.eval(source)
+          bridged = mlx_to_torch(source, device="mps")
+          torch.mps.synchronize()
+          assert bridged.device.type == "mps"
+          print("MLX-to-PyTorch MPS bridge passed")
+          PY
+
+      - name: Run repository-wide static gates
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          mkdir -p "$RESULT_DIR"
+          {
+            ruff check .
+            ruff format --check .
+            mypy vllm_metal
+            git diff --check
+          } 2>&1 | tee "$RESULT_DIR/static-gates.log"
+
+      - name: Run tensor-bridge tests in an isolated process
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          unset PYTORCH_MPS_HIGH_WATERMARK_RATIO
+          pytest -m 'not slow' tests/test_tensor_bridge.py -q --tb=short \
+            --junitxml="$RESULT_DIR/tensor-bridge.xml" \
+            2>&1 | tee "$RESULT_DIR/tensor-bridge.log"
+
+      - name: Run complete remaining non-slow unit suite
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          unset PYTORCH_MPS_HIGH_WATERMARK_RATIO
+          pytest -m 'not slow' tests/ -q --tb=short \
+            --ignore=tests/test_tensor_bridge.py \
+            --junitxml="$RESULT_DIR/non-slow-suite.xml" \
+            2>&1 | tee "$RESULT_DIR/non-slow-suite.log"
+
+      - name: Record exact validated revisions
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$RESULT_DIR"
+          {
+            echo "pr_head_sha=${PR_HEAD_SHA}"
+            echo "validation_commit=${GITHUB_SHA}"
+            echo "mlx_lm_mtp_sha=${MLX_LM_MTP_SHA}"
+            sw_vers
+            uname -a
+            system_profiler SPHardwareDataType
+          } | tee "$RESULT_DIR/revisions-and-runner.txt"
+
+      - name: Upload full validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr618-final-full-validation
+          path: ${{ env.RESULT_DIR }}
+          if-no-files-found: warn
