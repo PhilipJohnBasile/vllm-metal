@@ -1,0 +1,120 @@
+name: Inspect AX Qwen3.6 MTP sidecar compatibility
+
+on:
+  push:
+    branches:
+      - diagnostic/ax-qwen36-sidecar-compat
+    paths:
+      - .github/workflows/inspect-ax-qwen36-sidecar.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Inspect public metadata and safetensors header
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install 'huggingface_hub>=0.34' requests
+          mkdir -p /tmp/ax-sidecar-inspection
+          python - <<'PY' | tee /tmp/ax-sidecar-inspection/inspection.txt
+          from __future__ import annotations
+
+          import json
+          import struct
+          from pathlib import Path
+
+          import requests
+          from huggingface_hub import hf_hub_download, hf_hub_url
+
+          repo = "AutomatosX/AX-Qwen3.6-27B-MLX-6bit-MTP"
+          output = Path("/tmp/ax-sidecar-inspection")
+          files = [
+              "config.json",
+              "model.safetensors.index.json",
+              "ax_mtp_sidecar_manifest.json",
+              "mtplx_runtime.json",
+          ]
+          metadata = {}
+          for name in files:
+              path = Path(hf_hub_download(repo_id=repo, filename=name))
+              value = json.loads(path.read_text())
+              metadata[name] = value
+              (output / name).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+              print(f"===== {name} =====")
+              print(json.dumps(value, indent=2, sort_keys=True)[:30000])
+
+          url = hf_hub_url(repo_id=repo, filename="mtp.safetensors")
+          headers = {"Accept-Encoding": "identity", "Range": "bytes=0-7"}
+          response = requests.get(url, headers=headers, timeout=120, allow_redirects=True)
+          response.raise_for_status()
+          if len(response.content) < 8:
+              raise RuntimeError(f"short safetensors prefix: {len(response.content)} bytes")
+          header_len = struct.unpack("<Q", response.content[:8])[0]
+          end = 8 + header_len - 1
+          response = requests.get(
+              url,
+              headers={"Accept-Encoding": "identity", "Range": f"bytes=8-{end}"},
+              timeout=120,
+              allow_redirects=True,
+          )
+          response.raise_for_status()
+          payload = response.content
+          if len(payload) != header_len:
+              if len(payload) >= 8 + header_len:
+                  payload = payload[8 : 8 + header_len]
+              elif len(payload) > header_len:
+                  payload = payload[:header_len]
+              else:
+                  raise RuntimeError(
+                      f"short safetensors header: expected {header_len}, got {len(payload)}"
+                  )
+          tensor_header = json.loads(payload)
+          tensor_rows = {
+              key: {
+                  "dtype": value.get("dtype"),
+                  "shape": value.get("shape"),
+                  "data_offsets": value.get("data_offsets"),
+              }
+              for key, value in tensor_header.items()
+              if key != "__metadata__"
+          }
+          result = {
+              "repo": repo,
+              "header_length": header_len,
+              "tensor_count": len(tensor_rows),
+              "tensor_rows": tensor_rows,
+              "header_metadata": tensor_header.get("__metadata__", {}),
+              "base_index_has_mtp_keys": any(
+                  "mtp." in key
+                  for key in metadata["model.safetensors.index.json"].get("weight_map", {})
+              ),
+              "config_mtp_num_hidden_layers": (
+                  metadata["config.json"].get("text_config", {}).get(
+                      "mtp_num_hidden_layers"
+                  )
+                  or metadata["config.json"].get("mtp_num_hidden_layers")
+              ),
+          }
+          (output / "sidecar_header.json").write_text(
+              json.dumps(result, indent=2, sort_keys=True) + "\n"
+          )
+          print("===== SIDECAR HEADER =====")
+          print(json.dumps(result, indent=2, sort_keys=True))
+          PY
+
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: ax-qwen36-sidecar-inspection
+          path: /tmp/ax-sidecar-inspection
+          if-no-files-found: error
