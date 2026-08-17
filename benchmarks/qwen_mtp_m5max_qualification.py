@@ -43,7 +43,6 @@ from vllm.benchmarks.lib.endpoint_request_func import (
 )
 from vllm.benchmarks.serve import fetch_spec_decode_metrics
 
-
 SPEC_CONFIG = '{"method":"mtp","num_speculative_tokens":1}'
 SERVED_MODEL_NAME = "qwen36-m5max-mtp-qualification"
 
@@ -574,7 +573,7 @@ class ServingBenchmarker:
                             for index in indices
                         )
                     )
-                    for index, output in zip(indices, wave):
+                    for index, output in zip(indices, wave, strict=True):
                         outputs_by_index[index] = output
                 elapsed = time.perf_counter() - started
                 outputs = [output for output in outputs_by_index if output is not None]
@@ -752,9 +751,7 @@ def aggregate(
         valid_acceptance = [
             float(value) for value in acceptance_values if value is not None
         ]
-        if len(valid_acceptance) != 2 or any(
-            value <= 0 for value in valid_acceptance
-        ):
+        if len(valid_acceptance) != 2 or any(value <= 0 for value in valid_acceptance):
             acceptance_failures.append(workload)
 
         workload_summaries[workload] = {
