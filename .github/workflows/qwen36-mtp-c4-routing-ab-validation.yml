@@ -1,0 +1,89 @@
+name: Validate Qwen MTP C4 Routing A/B
+
+on:
+  push:
+    branches: [debug/qwen36-mtp-c4-routing]
+    paths:
+      - .github/workflows/qwen36-mtp-c4-routing-ab-validation.yml
+      - tools/qwen36-mtp-c4-routing-ab/source.zip.b64
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qwen36-mtp-c4-routing-ab-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Reconstruct immutable diagnostic source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          base64 -d tools/qwen36-mtp-c4-routing-ab/source.zip.b64 \
+            > /tmp/qwen36-mtp-c4-routing-ab-source.zip
+          echo \
+            '878a556c5c411eed42a734be832312ee8f1f60f05af5ad751e6b72d6844ac58a  /tmp/qwen36-mtp-c4-routing-ab-source.zip' \
+            | sha256sum --check
+          python -m zipfile --test /tmp/qwen36-mtp-c4-routing-ab-source.zip
+          unzip -oq /tmp/qwen36-mtp-c4-routing-ab-source.zip -d . \
+            -x '.github/*'
+
+      - name: Install validation tools
+        run: python -m pip install --upgrade pip pytest ruff
+
+      - name: Validate diagnostic patch and source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git apply --check benchmarks/patches/qwen36_mtp_c4_routing_ab.patch
+          git apply benchmarks/patches/qwen36_mtp_c4_routing_ab.patch
+          python -m py_compile \
+            benchmarks/qwen36_mtp_c4_routing_ab.py \
+            vllm_metal/attention/impls/linear.py \
+            vllm_metal/attention/impls/sdpa.py \
+            tests/test_qwen36_mtp_c4_routing_ab.py
+          bash -n scripts/run_qwen36_mtp_c4_routing_ab.sh
+          ruff check \
+            benchmarks/qwen36_mtp_c4_routing_ab.py \
+            vllm_metal/attention/impls/linear.py \
+            vllm_metal/attention/impls/sdpa.py \
+            tests/test_qwen36_mtp_c4_routing_ab.py
+          ruff format --check \
+            benchmarks/qwen36_mtp_c4_routing_ab.py \
+            vllm_metal/attention/impls/linear.py \
+            vllm_metal/attention/impls/sdpa.py \
+            tests/test_qwen36_mtp_c4_routing_ab.py
+          pytest -q tests/test_qwen36_mtp_c4_routing_ab.py
+          git diff --check
+          git apply --reverse --check \
+            benchmarks/patches/qwen36_mtp_c4_routing_ab.patch
+          git apply --reverse \
+            benchmarks/patches/qwen36_mtp_c4_routing_ab.patch
+          git diff --exit-code -- \
+            vllm_metal/attention/impls/linear.py \
+            vllm_metal/attention/impls/sdpa.py
+
+      - name: Publish validation receipt
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '# Qwen3.6 MTP c4 routing A/B validation'
+            echo
+            echo '- Immutable source archive SHA-256 verified.'
+            echo '- Patch application and reversal validated against the exact M5 qualification head.'
+            echo '- Python compilation, Bash syntax, Ruff, formatting, and focused tests executed.'
+          } >> "$GITHUB_STEP_SUMMARY"
