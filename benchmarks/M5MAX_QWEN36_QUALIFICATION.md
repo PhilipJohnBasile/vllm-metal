@@ -10,6 +10,7 @@ PR so benchmark tooling and local evidence do not enlarge the production diff.
 - MLX-LM native-MTP head: `a9fd7ef1032419a584ead9a38bdb66635f2d85c3`
 - vLLM CPU wheel: `0.27.1+cpu` for CPython 3.12 / macOS arm64
 - target checkpoint: `Qwen/Qwen3.6-27B`
+- preferred ready-made package: `AutomatosX/AX-Qwen3.6-27B-MLX-6bit-MTP`
 - native speculative depth exposed by vLLM Metal: one token
 
 Qwen3.6-27B is the official current 27B dense checkpoint. The earlier working
@@ -27,12 +28,41 @@ a specific diagnostic. In particular, the AutomatosX AX Engine packages keep
 the target shards and MTP sidecar separate; standard MLX-LM ignores that
 sidecar, so those directories are not accepted unchanged by this gate.
 
-The reproducible path is to convert the official checkpoint with the exact
-MLX-LM PR head. The runner can do that automatically.
+The sidecar has now been independently inspected: its 15 BF16 tensors use the
+exact native `mlx-lm#1740` names, dtypes, shapes, and contiguous byte spans. The
+preferred fast path is therefore a fail-closed index adoption, not a tensor rewrite.
+The adopter verifies the AX provenance manifest and full sidecar SHA-256 before it
+creates a separate model directory. Official conversion remains the clean fallback.
 
 ## One-command run
 
-From this branch on the physical M5 Max:
+From this branch on the physical M5 Max, the preferred path is:
+
+```bash
+scripts/run_m5max_qwen36_qualification.sh \
+  --model-dir "$HOME/Models/AX-Qwen3.6-27B-6bit-native-mtp" \
+  --prepare-ax
+```
+
+This creates a dedicated Python 3.12 environment, installs the exact source
+stack, downloads or reuses the 23.7 GB AX package in the Hugging Face cache,
+validates its 849 MB MTP sidecar, creates a standard-MLX-compatible model
+directory, builds the Metal artifacts, and executes the qualification.
+
+`--link-mode auto` first tries hardlinks and otherwise uses absolute symlinks,
+so the adopted directory normally consumes almost no duplicate model storage.
+Do not delete the source package when the receipt reports symlink materialization.
+Use `--link-mode copy` when a fully independent second copy is required.
+
+To adopt a package already downloaded by OMLX or another application:
+
+```bash
+scripts/run_m5max_qwen36_qualification.sh \
+  --model-dir "$HOME/Models/AX-Qwen3.6-27B-6bit-native-mtp" \
+  --adopt-ax-sidecar "/path/to/AX-Qwen3.6-27B-MLX-6bit-MTP"
+```
+
+The official conversion path remains available:
 
 ```bash
 scripts/run_m5max_qwen36_qualification.sh \
@@ -40,24 +70,18 @@ scripts/run_m5max_qwen36_qualification.sh \
   --prepare-official
 ```
 
-The first run creates a dedicated Python 3.12 virtual environment, installs the
-exact source stack, builds the native Metal extension and shader libraries,
-downloads the official checkpoint, converts it to MLX affine 6-bit/group-64
-while retaining MTP weights, and executes the qualification.
-
 The official BF16 download plus converted output can require roughly 100 GiB
-of temporary/free disk space. Subsequent runs can reuse both environment and
-model:
+of temporary/free disk space. Subsequent runs can reuse the environment and
+adopted or converted model:
 
 ```bash
 scripts/run_m5max_qwen36_qualification.sh \
-  --model-dir "$HOME/Models/Qwen3.6-27B-6bit-native-mtp" \
+  --model-dir "$HOME/Models/AX-Qwen3.6-27B-6bit-native-mtp" \
   --skip-install
 ```
 
-To run an already completed compatible conversion, omit `--prepare-official`.
-To smoke-test the harness on another arm64 Mac, add `--allow-non-m5max`; such a
-run does not qualify an M5 Max performance claim.
+To smoke-test the harness on another arm64 Mac, add `--allow-non-m5max`;
+such a run does not qualify an M5 Max performance claim.
 
 ## What is measured
 

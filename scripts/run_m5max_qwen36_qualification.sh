@@ -10,6 +10,10 @@ VENV_DIR="${VENV_DIR:-$REPO_ROOT/.venv-m5max-qwen36}"
 MODEL_DIR=""
 OUTPUT_DIR=""
 PREPARE_OFFICIAL=0
+PREPARE_AX=0
+AX_SOURCE_DIR=""
+AX_REPO="AutomatosX/AX-Qwen3.6-27B-MLX-6bit-MTP"
+LINK_MODE="auto"
 Q_BITS=6
 SKIP_INSTALL=0
 ALLOW_NON_M5MAX=0
@@ -25,8 +29,12 @@ Required:
   --model-dir PATH          Native MLX model directory containing mtp.* tensors.
 
 Options:
+  --prepare-ax              Download/reuse the AX 6-bit package and safely
+                            adopt its compatible MTP sidecar into MODEL_DIR.
+  --adopt-ax-sidecar PATH   Adopt an already-downloaded AX package from PATH.
+  --link-mode MODE          auto, hardlink, symlink, or copy (default: auto).
   --prepare-official        Convert Qwen/Qwen3.6-27B into MODEL_DIR first.
-  --q-bits N                Quantization bits for conversion (default: 6).
+  --q-bits N                Quantization bits for official conversion (default: 6).
   --output-dir PATH         Evidence directory (default: ~/vllm-metal-results/...).
   --repeats N               Timed repetitions per workload/launch (default: 3).
   --skip-install            Reuse the existing qualification virtualenv.
@@ -44,6 +52,18 @@ while (($#)); do
   case "$1" in
     --model-dir)
       MODEL_DIR="$2"
+      shift 2
+      ;;
+    --prepare-ax)
+      PREPARE_AX=1
+      shift
+      ;;
+    --adopt-ax-sidecar)
+      AX_SOURCE_DIR="$2"
+      shift 2
+      ;;
+    --link-mode)
+      LINK_MODE="$2"
       shift 2
       ;;
     --prepare-official)
@@ -99,6 +119,18 @@ if [[ ! "$REPEATS" =~ ^[2-9][0-9]*$ ]]; then
   echo "--repeats must be an integer >= 2" >&2
   exit 64
 fi
+if [[ ! "$LINK_MODE" =~ ^(auto|hardlink|symlink|copy)$ ]]; then
+  echo "--link-mode must be auto, hardlink, symlink, or copy" >&2
+  exit 64
+fi
+preparation_modes=$((PREPARE_OFFICIAL + PREPARE_AX))
+if [[ -n "$AX_SOURCE_DIR" ]]; then
+  preparation_modes=$((preparation_modes + 1))
+fi
+if ((preparation_modes > 1)); then
+  echo "Choose only one of --prepare-ax, --adopt-ax-sidecar, or --prepare-official." >&2
+  exit 64
+fi
 
 MODEL_DIR="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$MODEL_DIR")"
 if [[ -z "$OUTPUT_DIR" ]]; then
@@ -123,6 +155,7 @@ echo "Model:      $MODEL_DIR"
 echo "Evidence:   $OUTPUT_DIR"
 echo "Chip:       ${CHIP:-unknown}"
 echo "MLX-LM:     $MLX_LM_MTP_SHA"
+echo "AX package:  $AX_REPO"
 
 if [[ "$SKIP_INSTALL" -ne 1 ]]; then
   python3.12 -m venv "$VENV_DIR"
@@ -145,7 +178,21 @@ else
   source "$VENV_DIR/bin/activate"
 fi
 
-if [[ "$PREPARE_OFFICIAL" -eq 1 ]]; then
+if [[ "$PREPARE_AX" -eq 1 || -n "$AX_SOURCE_DIR" ]]; then
+  if [[ -e "$MODEL_DIR" ]]; then
+    if [[ ! -f "$MODEL_DIR/config.json" ]]; then
+      echo "Refusing to adopt into non-model path: $MODEL_DIR" >&2
+      exit 2
+    fi
+    echo "Model directory already exists; validating it instead of adopting again."
+  else
+    if [[ "$PREPARE_AX" -eq 1 ]]; then
+      echo "Downloading or reusing $AX_REPO from the Hugging Face cache..."
+      AX_SOURCE_DIR="$(AX_REPO="$AX_REPO" python -c 'import os; from huggingface_hub import snapshot_download; print(snapshot_download(repo_id=os.environ["AX_REPO"]))')"
+    fi
+    python scripts/adopt_ax_qwen36_mtp_sidecar.py       "$AX_SOURCE_DIR"       "$MODEL_DIR"       --link-mode "$LINK_MODE"
+  fi
+elif [[ "$PREPARE_OFFICIAL" -eq 1 ]]; then
   if [[ -e "$MODEL_DIR" ]]; then
     if [[ ! -f "$MODEL_DIR/config.json" ]]; then
       echo "Refusing to convert into non-model path: $MODEL_DIR" >&2
@@ -162,19 +209,14 @@ if [[ "$PREPARE_OFFICIAL" -eq 1 ]]; then
       echo "6-bit output can require roughly 100 GiB of temporary/free space." >&2
     fi
     echo "Converting official Qwen/Qwen3.6-27B with native MTP tensors..."
-    python -m mlx_lm.convert \
-      --hf-path Qwen/Qwen3.6-27B \
-      --mlx-path "$MODEL_DIR" \
-      -q \
-      --q-bits "$Q_BITS" \
-      --q-group-size 64 \
-      --dtype bfloat16
+    python -m mlx_lm.convert       --hf-path Qwen/Qwen3.6-27B       --mlx-path "$MODEL_DIR"       -q       --q-bits "$Q_BITS"       --q-group-size 64       --dtype bfloat16
   fi
 fi
 
 if [[ ! -f "$MODEL_DIR/config.json" ]]; then
   echo "No model found at $MODEL_DIR." >&2
-  echo "Pass --prepare-official or point --model-dir at a completed native-MTP MLX conversion." >&2
+  echo "Pass --prepare-ax, --adopt-ax-sidecar, --prepare-official, or point" >&2
+  echo "--model-dir at a completed native-MTP MLX model." >&2
   exit 2
 fi
 
@@ -190,6 +232,9 @@ export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-lo0}"
   echo "mlx_lm_mtp_sha=$MLX_LM_MTP_SHA"
   echo "model_dir=$MODEL_DIR"
   echo "model_config_sha256=$(shasum -a 256 "$MODEL_DIR/config.json" | awk '{print $1}')"
+  if [[ -f "$MODEL_DIR/native_mtp_adoption.json" ]]; then
+    echo "native_mtp_adoption_sha256=$(shasum -a 256 "$MODEL_DIR/native_mtp_adoption.json" | awk '{print $1}')"
+  fi
   sw_vers
   uname -a
   system_profiler SPHardwareDataType

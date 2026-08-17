@@ -204,6 +204,34 @@ def validate_source(source_dir: Path) -> dict[str, Any]:
                 f"{key} contract mismatch: expected {(expected_dtype, expected_shape)}, "
                 f"got {(actual_dtype, actual_shape)}"
             )
+        offsets = tuple(int(value) for value in row.get("data_offsets", []))
+        if len(offsets) != 2 or offsets[0] < 0 or offsets[1] < offsets[0]:
+            raise RuntimeError(f"{key} has invalid data_offsets: {offsets}")
+        expected_bytes = math.prod(expected_shape) * 2
+        if offsets[1] - offsets[0] != expected_bytes:
+            raise RuntimeError(
+                f"{key} byte-span mismatch: expected {expected_bytes}, "
+                f"got {offsets[1] - offsets[0]}"
+            )
+
+    spans = sorted(
+        (
+            int(row["data_offsets"][0]),
+            int(row["data_offsets"][1]),
+            key,
+        )
+        for key, row in tensor_rows.items()
+    )
+    cursor = 0
+    for start, end, key in spans:
+        if start != cursor:
+            raise RuntimeError(
+                f"sidecar data is not a contiguous non-overlapping slab at {key}: "
+                f"expected start {cursor}, got {start}"
+            )
+        cursor = end
+    if cursor != data_bytes:
+        raise RuntimeError(f"sidecar data-span mismatch: {cursor} != {data_bytes}")
 
     manifest_mtp = manifest.get("output", {}).get("mtp", {})
     expected_sidecar_sha = str(manifest_mtp.get("sha256", ""))
@@ -222,7 +250,8 @@ def validate_source(source_dir: Path) -> dict[str, Any]:
         )
 
     parameter_count = sum(
-        math.prod(expected_shape) for _dtype, expected_shape in EXPECTED_TENSORS.values()
+        math.prod(expected_shape)
+        for _dtype, expected_shape in EXPECTED_TENSORS.values()
     )
     return {
         "config": config,
@@ -360,7 +389,9 @@ def main() -> int:
     args = parse_args()
     receipt = build_adopted_model(args.source_dir, args.output_dir, args.link_mode)
     print(json.dumps(receipt, indent=2, sort_keys=True))
-    print(f"Native-MTP model directory created: {args.output_dir.expanduser().absolute()}")
+    print(
+        f"Native-MTP model directory created: {args.output_dir.expanduser().absolute()}"
+    )
     return 0
 
 
