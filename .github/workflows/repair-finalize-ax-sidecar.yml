@@ -23,6 +23,7 @@ jobs:
         run: |
           set -euxo pipefail
           python - <<'PY'
+          import re
           from pathlib import Path
 
           path = Path(".github/workflows/finalize-ax-sidecar-adoption.yml")
@@ -33,8 +34,13 @@ jobs:
               raise SystemExit(f"expected one AX heredoc marker, found {marker_count}")
           marker_start = source.index(marker)
           start = source.rfind("\n", 0, marker_start) + 1
-          end_marker = "\n" + "P" + "Y\n)\""
-          end = source.index(end_marker, marker_start) + len(end_marker)
+          terminator = re.search(
+              r'\n[ \t]*P' + r'Y[ \t]*\n[ \t]*\)"',
+              source[marker_start:],
+          )
+          if terminator is None:
+              raise SystemExit("AX heredoc terminator was not found")
+          end = marker_start + terminator.end()
           indent = source[start:marker_start]
           replacement = indent + (
               'AX_SOURCE_DIR="$(AX_REPO="$AX_REPO" python -c '
