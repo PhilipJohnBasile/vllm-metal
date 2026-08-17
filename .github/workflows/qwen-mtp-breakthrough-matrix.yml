@@ -1,0 +1,383 @@
+name: Qwen MTP Breakthrough Matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      repeats:
+        description: Timed repetitions per serving workload
+        required: true
+        default: "5"
+        type: choice
+        options: ["3", "5", "7"]
+  push:
+    branches: [perf/qwen-mtp-breakthrough-matrix]
+    paths:
+      - .github/workflows/qwen-mtp-breakthrough-matrix.yml
+      - benchmarks/qwen_mtp_breakthrough_matrix.py.gz
+      - benchmarks/qwen_mtp_breakthrough_aggregate.py
+      - benchmarks/patches/qwen_mtp_copyless_gdn.patch
+      - vllm_metal/experimental/gdn_deferred_decode_state.py
+      - vllm_metal/envs.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qwen-mtp-breakthrough-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MODEL_DIR: /Users/runner/.cache/vllm-metal-bench/Qwen3.5-0.8B-4bit-mtp
+  MLX_LM_MTP_SHA: ac6aaffd8fdfb8c8e713e17f155d83e3d72b0a0f
+  GLOO_SOCKET_IFNAME: lo0
+  VLLM_METAL_USE_PAGED_ATTENTION: "1"
+  VLLM_METAL_MEMORY_FRACTION: auto
+
+jobs:
+  validate-candidates:
+    name: validate-copyless-plus-deferred
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Validate compressed runner and matrix coverage
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gzip -t benchmarks/qwen_mtp_breakthrough_matrix.py.gz
+          gzip -dc benchmarks/qwen_mtp_breakthrough_matrix.py.gz \
+            > /tmp/qwen_mtp_breakthrough_matrix.py
+          python -m py_compile \
+            /tmp/qwen_mtp_breakthrough_matrix.py \
+            benchmarks/qwen_mtp_breakthrough_aggregate.py
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          tree = ast.parse(Path('/tmp/qwen_mtp_breakthrough_matrix.py').read_text())
+          text = Path('/tmp/qwen_mtp_breakthrough_matrix.py').read_text()
+          required_arms = {
+              'baseline_start',
+              'mtp_current',
+              'mtp_deferred',
+              'mtp_copyless',
+              'mtp_combo',
+              'mtp_combo_verify',
+              'baseline_inproc_start',
+              'mtp_combo_inproc',
+              'baseline_inproc_end',
+              'baseline_end',
+          }
+          missing = sorted(name for name in required_arms if f'"{name}"' not in text)
+          if missing:
+              raise SystemExit(f'missing breakthrough arms: {missing}')
+          print('AST nodes:', sum(1 for _ in ast.walk(tree)))
+          print('All breakthrough arms present.')
+          PY
+
+      - name: Install current stack and native kernels
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip uv
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install \
+            'https://github.com/vllm-project/vllm/releases/download/v0.27.1/vllm-0.27.1%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl'
+          VLLM_METAL_BUILD_FROM_SOURCE=1 python -m pip install -e '.[dev]'
+          python -m pip install --force-reinstall --no-deps \
+            "git+https://github.com/PhilipJohnBasile/mlx-lm@${MLX_LM_MTP_SHA}"
+          source scripts/lib.sh
+          ensure_metal_toolchain
+          build_native_artifacts
+
+      - name: Apply copyless candidate and run focused correctness suite
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          git apply --check --whitespace=nowarn \
+            benchmarks/patches/qwen_mtp_copyless_gdn.patch
+          git apply --whitespace=nowarn \
+            benchmarks/patches/qwen_mtp_copyless_gdn.patch
+          python -m py_compile \
+            vllm_metal/attention/impls/gdn_lazy.py \
+            vllm_metal/attention/impls/linear.py \
+            vllm_metal/experimental/gdn_deferred_decode_state.py
+          pytest -q \
+            tests/test_gdn_lazy_wrapper.py \
+            tests/attention/test_align_gdn_state_manager.py \
+            tests/test_qwen_native_mtp_proposer.py \
+            tests/test_qwen_mtp_paged_cache.py \
+            tests/test_gdn_deferred_decode_state.py
+          git diff --check
+
+  benchmark:
+    name: ${{ matrix.name }}
+    needs: validate-candidates
+    runs-on: macos-15
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: serving-short
+            mode: serving
+            workloads: interactive_c1,serving_c4
+            arms: baseline_start,mtp_current,mtp_deferred,mtp_copyless,mtp_combo,baseline_inproc_start,mtp_combo_inproc,baseline_inproc_end,baseline_end
+            max_model_len: "1280"
+            max_num_seqs: "4"
+            retained_prefixes: "0"
+          - name: serving-scale
+            mode: serving
+            workloads: serving_c8,serving_c16
+            arms: baseline_start,mtp_current,mtp_deferred,mtp_copyless,mtp_combo,mtp_combo_verify,baseline_inproc_start,mtp_combo_inproc,baseline_inproc_end,baseline_end
+            max_model_len: "1280"
+            max_num_seqs: "16"
+            retained_prefixes: "0"
+          - name: serving-long
+            mode: serving
+            workloads: long_prefix_c1,long_prefix_c4
+            arms: baseline_start,mtp_current,mtp_deferred,mtp_copyless,mtp_combo,mtp_combo_verify,baseline_inproc_start,mtp_combo_inproc,baseline_inproc_end,baseline_end
+            max_model_len: "8448"
+            max_num_seqs: "4"
+            retained_prefixes: "0"
+          - name: pressure-0
+            mode: pressure
+            workloads: interactive_c1
+            arms: baseline_start,mtp_current,mtp_deferred,mtp_copyless,mtp_combo,baseline_end
+            max_model_len: "1280"
+            max_num_seqs: "4"
+            retained_prefixes: "0"
+          - name: pressure-8
+            mode: pressure
+            workloads: interactive_c1
+            arms: baseline_start,mtp_current,mtp_deferred,mtp_copyless,mtp_combo,baseline_end
+            max_model_len: "1280"
+            max_num_seqs: "4"
+            retained_prefixes: "8"
+          - name: pressure-24
+            mode: pressure
+            workloads: interactive_c1
+            arms: baseline_start,mtp_current,mtp_deferred,mtp_copyless,mtp_combo,baseline_end
+            max_model_len: "1280"
+            max_num_seqs: "4"
+            retained_prefixes: "24"
+
+    env:
+      RESULT_DIR: ${{ runner.temp }}/qwen-mtp-breakthrough-${{ matrix.name }}
+      RUNNER_SCRIPT: ${{ runner.temp }}/qwen_mtp_breakthrough_matrix.py
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Inflate benchmark runner
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gzip -t benchmarks/qwen_mtp_breakthrough_matrix.py.gz
+          gzip -dc benchmarks/qwen_mtp_breakthrough_matrix.py.gz > "$RUNNER_SCRIPT"
+          python -m py_compile "$RUNNER_SCRIPT"
+          sha256sum \
+            "$RUNNER_SCRIPT" \
+            benchmarks/patches/qwen_mtp_copyless_gdn.patch
+
+      - name: Cache converted benchmark model
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MODEL_DIR }}
+          key: qwen35-08b-4bit-mtp-breakthrough-${{ runner.os }}-${{ runner.arch }}-${{ env.MLX_LM_MTP_SHA }}
+
+      - name: Install vLLM Metal and exact mlx-lm MTP head
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip uv
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install \
+            'https://github.com/vllm-project/vllm/releases/download/v0.27.1/vllm-0.27.1%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl'
+          VLLM_METAL_BUILD_FROM_SOURCE=1 python -m pip install -e '.[dev]'
+          python -m pip install --force-reinstall --no-deps \
+            "git+https://github.com/PhilipJohnBasile/mlx-lm@${MLX_LM_MTP_SHA}"
+          source scripts/lib.sh
+          ensure_metal_toolchain
+          build_native_artifacts
+
+      - name: Convert Qwen3.5-0.8B with MTP weights
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          rm -rf "$MODEL_DIR"
+          mkdir -p "$(dirname "$MODEL_DIR")"
+          python -m mlx_lm.convert \
+            --hf-path Qwen/Qwen3.5-0.8B \
+            --mlx-path "$MODEL_DIR" \
+            -q --q-bits 4 --q-group-size 64
+
+      - name: Verify trained MTP head and record runner
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          mkdir -p "$RESULT_DIR"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import mlx.core as mx
+          from mlx_lm.utils import load
+
+          model, _ = load(os.environ['MODEL_DIR'])
+          record = {
+              'supports_mtp': bool(getattr(model, 'supports_mtp', False)),
+              'mtp_cache_entries': len(model.make_mtp_cache()),
+              'mlx_version': mx.__version__,
+              'device_info': mx.device_info(),
+          }
+          Path(os.environ['RESULT_DIR'], 'stack.json').write_text(
+              json.dumps(record, indent=2, default=str) + '\n'
+          )
+          assert record['supports_mtp'] and record['mtp_cache_entries']
+          PY
+          {
+            echo "git_sha=${GITHUB_SHA}"
+            echo "mlx_lm_mtp_sha=${MLX_LM_MTP_SHA}"
+            echo "shard=${{ matrix.name }}"
+            sw_vers
+            uname -a
+            sysctl -n machdep.cpu.brand_string || true
+            system_profiler SPHardwareDataType
+          } | tee "$RESULT_DIR/runner.txt"
+
+      - name: Run targeted breakthrough shard
+        id: breakthrough
+        continue-on-error: true
+        shell: bash
+        env:
+          REQUESTED_REPEATS: ${{ inputs.repeats || '5' }}
+        run: |
+          set -o pipefail
+          source .venv/bin/activate
+          python "$RUNNER_SCRIPT" \
+            --model-dir "$MODEL_DIR" \
+            --output-dir "$RESULT_DIR" \
+            --copyless-patch benchmarks/patches/qwen_mtp_copyless_gdn.patch \
+            --mode '${{ matrix.mode }}' \
+            --arms '${{ matrix.arms }}' \
+            --workloads '${{ matrix.workloads }}' \
+            --repeats "$REQUESTED_REPEATS" \
+            --pressure-retained-prefixes '${{ matrix.retained_prefixes }}' \
+            --pressure-probes 7 \
+            --max-model-len '${{ matrix.max_model_len }}' \
+            --max-num-seqs '${{ matrix.max_num_seqs }}' \
+            --max-num-batched-tokens 4096 \
+            --block-size 16 \
+            --request-timeout-s 360 \
+            --server-ready-timeout-s 900 \
+            2>&1 | tee "$RESULT_DIR/run.log"
+
+      - name: Publish shard summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RESULT_DIR/breakthrough_summary.md" ]; then
+            cat "$RESULT_DIR/breakthrough_summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '# %s\n\nNo final report was produced.\n' \
+              '${{ matrix.name }}' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload shard artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-mtp-breakthrough-${{ matrix.name }}
+          path: ${{ env.RESULT_DIR }}
+          if-no-files-found: warn
+
+      - name: Mark incomplete or incorrect shard
+        if: steps.breakthrough.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "Breakthrough shard ${{ matrix.name }} did not clear its correctness/completion gate." >&2
+          exit 1
+
+  aggregate:
+    name: aggregate-breakthrough-matrix
+    needs: benchmark
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Download available shard artifacts
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: qwen-mtp-breakthrough-*
+          path: /tmp/qwen-mtp-breakthrough-shards
+
+      - name: Build normalized combined report
+        id: aggregate
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          python benchmarks/qwen_mtp_breakthrough_aggregate.py \
+            --root /tmp/qwen-mtp-breakthrough-shards \
+            --output-dir /tmp/qwen-mtp-breakthrough-combined \
+            2>&1 | tee /tmp/qwen-mtp-breakthrough-combined.log
+          if [ -f /tmp/qwen-mtp-breakthrough-combined/combined_summary.md ]; then
+            cat /tmp/qwen-mtp-breakthrough-combined/combined_summary.md \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Preserve aggregate log
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p /tmp/qwen-mtp-breakthrough-combined
+          cp /tmp/qwen-mtp-breakthrough-combined.log \
+            /tmp/qwen-mtp-breakthrough-combined/aggregate.log 2>/dev/null || true
+
+      - name: Upload combined result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-mtp-breakthrough-combined
+          path: /tmp/qwen-mtp-breakthrough-combined
+          if-no-files-found: warn
+
+      - name: Fail when the combined correctness gate did not clear
+        if: steps.aggregate.outcome == 'failure'
+        shell: bash
+        run: exit 1
