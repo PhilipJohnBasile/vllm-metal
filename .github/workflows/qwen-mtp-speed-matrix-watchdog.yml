@@ -1,0 +1,93 @@
+name: Arm Qwen MTP Shard Fallback
+
+on:
+  push:
+    branches:
+      - bench/qwen-mtp-speed-shards
+    paths:
+      - .github/workflows/qwen-mtp-speed-matrix-watchdog.yml
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  wait-and-dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ORIGINAL_RUN_ID: "31966399394"
+      FALLBACK_REF: bench/qwen-mtp-speed-shards
+      FALLBACK_WORKFLOW: qwen-mtp-speed-matrix-shards.yml
+      NOT_BEFORE_UTC: "2026-08-17T01:10:00Z"
+    steps:
+      - name: Wait until the hosted matrix has exhausted its six-hour window
+        shell: bash
+        run: |
+          set -euo pipefail
+          now=$(date -u +%s)
+          target=$(date -u -d "$NOT_BEFORE_UTC" +%s)
+          if [ "$now" -lt "$target" ]; then
+            remaining=$((target - now))
+            echo "Waiting ${remaining}s until ${NOT_BEFORE_UTC}."
+            sleep "$remaining"
+          fi
+
+      - name: Dispatch shards only when the monolithic run did not succeed
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const originalRunId = Number(process.env.ORIGINAL_RUN_ID);
+            const fallbackRef = process.env.FALLBACK_REF;
+            const workflowId = process.env.FALLBACK_WORKFLOW;
+
+            const { data: original } = await github.rest.actions.getWorkflowRun({
+              owner,
+              repo,
+              run_id: originalRunId,
+            });
+            core.info(
+              `Original run ${originalRunId}: status=${original.status} ` +
+              `conclusion=${original.conclusion}`
+            );
+
+            if (original.status !== 'completed') {
+              core.notice('Original matrix is still active; leaving it untouched.');
+              return;
+            }
+            if (original.conclusion === 'success') {
+              core.notice('Original matrix succeeded; shard fallback is unnecessary.');
+              return;
+            }
+
+            const { data: existing } = await github.rest.actions.listWorkflowRuns({
+              owner,
+              repo,
+              workflow_id: workflowId,
+              branch: fallbackRef,
+              event: 'workflow_dispatch',
+              per_page: 20,
+            });
+            if (existing.workflow_runs.length > 0) {
+              core.notice(
+                `Shard fallback already has ${existing.workflow_runs.length} run(s); ` +
+                'not dispatching a duplicate.'
+              );
+              return;
+            }
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner,
+              repo,
+              workflow_id: workflowId,
+              ref: fallbackRef,
+              inputs: { repeats: '2' },
+            });
+            core.notice(
+              `Dispatched ${workflowId} on ${fallbackRef} because the original ` +
+              `matrix concluded ${original.conclusion}.`
+            );
