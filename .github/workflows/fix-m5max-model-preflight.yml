@@ -1,0 +1,258 @@
+name: Fix M5 Max model preflight loader contract
+
+on:
+  push:
+    branches:
+      - bench/m5max-qwen36-final-qualification
+    paths:
+      - .github/workflows/fix-m5max-model-preflight.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Patch preflight and documentation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one match, found {count}")
+              return text.replace(old, new, 1)
+
+          path = Path("benchmarks/qwen_mtp_m5max_qualification.py")
+          source = path.read_text()
+          old_function = '''def iter_weight_keys(model_dir: Path) -> tuple[list[str], list[str]]:
+              index_path = model_dir / "model.safetensors.index.json"
+              referenced_files: list[str] = []
+              keys: list[str] = []
+              if index_path.is_file():
+                  index = json.loads(index_path.read_text())
+                  weight_map = index.get("weight_map", {})
+                  if not isinstance(weight_map, dict):
+                      raise RuntimeError(f"invalid weight_map in {index_path}")
+                  keys.extend(str(key) for key in weight_map)
+                  referenced_files.extend(sorted({str(value) for value in weight_map.values()}))
+                  return keys, referenced_files
+
+              files = sorted(model_dir.glob("*.safetensors"))
+              for path in files:
+                  with safe_open(path, framework="numpy") as handle:
+                      keys.extend(str(key) for key in handle.keys())
+                  referenced_files.append(path.name)
+              return keys, referenced_files
+          '''
+          new_function = '''def iter_loader_weight_keys(model_dir: Path) -> tuple[list[str], list[str]]:
+              """Inspect exactly the files opened by MLX-LM's local-model loader."""
+              files = sorted(model_dir.glob("model*.safetensors"))
+              if not files:
+                  raise FileNotFoundError(
+                      f"MLX-LM will find no model*.safetensors files in {model_dir}"
+                  )
+              keys: list[str] = []
+              loader_files: list[str] = []
+              for path in files:
+                  with safe_open(path, framework="numpy") as handle:
+                      keys.extend(str(key) for key in handle.keys())
+                  loader_files.append(path.name)
+              return keys, loader_files
+          '''
+          source = replace_once(source, old_function, new_function, "loader key iterator")
+          source = replace_once(
+              source,
+              '''    keys, referenced_files = iter_weight_keys(model_dir)
+              mtp_keys = sorted(key for key in keys if "mtp." in key)
+              sidecar = model_dir / "mtp.safetensors"
+              sidecar_referenced = sidecar.name in referenced_files
+          ''',
+              '''    keys, loader_files = iter_loader_weight_keys(model_dir)
+              mtp_keys = sorted(key for key in keys if "mtp." in key)
+              standalone_sidecar = model_dir / "mtp.safetensors"
+              loader_sidecar = model_dir / "model-mtp.safetensors"
+          ''',
+              "inspect variables",
+          )
+          source = replace_once(
+              source,
+              '''        "referenced_weight_files": referenced_files,
+                  "standalone_mtp_sidecar_present": sidecar.is_file(),
+                  "standalone_mtp_sidecar_referenced": sidecar_referenced,
+          ''',
+              '''        "mlx_lm_loader_weight_files": loader_files,
+                  "standalone_mtp_sidecar_present": standalone_sidecar.is_file(),
+                  "loader_visible_mtp_sidecar_present": loader_sidecar.is_file(),
+          ''',
+              "inspect result",
+          )
+          source = replace_once(
+              source,
+              '''        detail = ""
+                  if sidecar.is_file() and not sidecar_referenced:
+                      detail = (
+                          " A standalone mtp.safetensors sidecar exists but is not part of "
+                          "model.safetensors.index.json; standard mlx-lm loading will ignore it."
+                      )
+                  raise RuntimeError(
+                      "the standard model weight map contains no native mtp.* tensors." + detail
+                  )
+          ''',
+              '''        detail = ""
+                  if standalone_sidecar.is_file() and not loader_sidecar.is_file():
+                      detail = (
+                          " A standalone mtp.safetensors sidecar exists, but this MLX-LM "
+                          "revision opens only model*.safetensors files. Create the validated "
+                          "model-mtp.safetensors alias with the sidecar adopter."
+                      )
+                  raise RuntimeError(
+                      "the files MLX-LM will actually open contain no native mtp.* tensors."
+                      + detail
+                  )
+          ''',
+              "inspect failure",
+          )
+          path.write_text(source)
+
+          docs_path = Path("benchmarks/M5MAX_QWEN36_QUALIFICATION.md")
+          docs = docs_path.read_text()
+          docs = replace_once(
+              docs,
+              '''The model directory must contain native `mtp.*` tensors in the ordinary MLX
+          weight map. A standalone engine-specific `mtp.safetensors` file is not enough
+          unless it is referenced by `model.safetensors.index.json` with keys matching
+          the MLX-LM Qwen MTP module.
+
+          The harness checks all of this before loading 27B weights and fails closed with
+          a specific diagnostic. In particular, the AutomatosX AX Engine packages keep
+          the target shards and MTP sidecar separate; standard MLX-LM ignores that
+          sidecar, so those directories are not accepted unchanged by this gate.
+          ''',
+              '''The model directory must expose native `mtp.*` tensors through a file matching
+          MLX-LM's local discovery rule, `model*.safetensors`. Updating only
+          `model.safetensors.index.json` is not sufficient in this revision. A standalone
+          engine-specific `mtp.safetensors` file is therefore ignored unless the validated
+          bytes are also exposed through the loader-visible `model-mtp.safetensors` alias.
+
+          The harness inspects exactly the files MLX-LM will open before loading 27B weights
+          and fails closed with a specific diagnostic. The AutomatosX AX Engine packages keep
+          the target shards and MTP sidecar separate, so those directories are not accepted
+          unchanged by this gate; use the included adopter.
+          ''',
+              "stale model requirement",
+          )
+          docs_path.write_text(docs)
+          PY
+
+      - name: Test negative and positive loader discovery
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install 'ruff==0.16.0' safetensors numpy
+          ruff check --fix benchmarks/qwen_mtp_m5max_qualification.py
+          ruff format benchmarks/qwen_mtp_m5max_qualification.py
+          ruff check benchmarks/qwen_mtp_m5max_qualification.py
+          ruff format --check benchmarks/qwen_mtp_m5max_qualification.py
+          python -m py_compile benchmarks/qwen_mtp_m5max_qualification.py
+          bash -n scripts/run_m5max_qwen36_qualification.sh
+          python - <<'PY'
+          from __future__ import annotations
+
+          import ast
+          import hashlib
+          import json
+          import os
+          import tempfile
+          from pathlib import Path
+
+          import numpy as np
+          from safetensors import safe_open
+          from safetensors.numpy import save_file
+
+          source_path = Path("benchmarks/qwen_mtp_m5max_qualification.py")
+          tree = ast.parse(source_path.read_text())
+          selected = {
+              "sha256_text",
+              "model_config",
+              "mtp_config_depth",
+              "iter_loader_weight_keys",
+              "inspect_model_contract",
+          }
+          body = [
+              node
+              for node in tree.body
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+              and node.name in selected
+          ]
+          namespace = {
+              "Path": Path,
+              "json": json,
+              "hashlib": hashlib,
+              "safe_open": safe_open,
+          }
+          exec(compile(ast.Module(body=body, type_ignores=[]), str(source_path), "exec"), namespace)
+          inspect_model_contract = namespace["inspect_model_contract"]
+
+          with tempfile.TemporaryDirectory() as temporary:
+              model_dir = Path(temporary)
+              (model_dir / "config.json").write_text(
+                  json.dumps(
+                      {
+                          "model_type": "qwen3_5",
+                          "mtp_num_hidden_layers": 1,
+                          "text_config": {"mtp_num_hidden_layers": 1},
+                      }
+                  )
+              )
+              save_file(
+                  {"language_model.lm_head.weight": np.zeros((1,), dtype=np.float32)},
+                  model_dir / "model-00001-of-00001.safetensors",
+              )
+              save_file(
+                  {"mtp.fc.weight": np.zeros((1,), dtype=np.float32)},
+                  model_dir / "mtp.safetensors",
+              )
+              try:
+                  inspect_model_contract(model_dir)
+              except RuntimeError as error:
+                  message = str(error)
+                  assert "model-mtp.safetensors" in message
+                  assert "model*.safetensors" in message
+              else:
+                  raise AssertionError("unaliased sidecar unexpectedly passed")
+
+              os.link(
+                  model_dir / "mtp.safetensors",
+                  model_dir / "model-mtp.safetensors",
+              )
+              result = inspect_model_contract(model_dir)
+              assert result["mtp_weight_key_count"] == 1
+              assert "model-mtp.safetensors" in result["mlx_lm_loader_weight_files"]
+              assert result["loader_visible_mtp_sidecar_present"] is True
+          print("qualification preflight loader-contract test passed")
+          PY
+          git diff --check
+
+      - name: Commit preflight repair
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add benchmarks/qwen_mtp_m5max_qualification.py \
+            benchmarks/M5MAX_QWEN36_QUALIFICATION.md
+          git commit -m 'bench: validate the actual MLX-LM weight discovery set'
+          git push origin HEAD:bench/m5max-qwen36-final-qualification
