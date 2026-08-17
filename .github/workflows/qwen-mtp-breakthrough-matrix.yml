@@ -173,8 +173,8 @@ jobs:
             retained_prefixes: "24"
 
     env:
-      RESULT_DIR: ${{ runner.temp }}/qwen-mtp-breakthrough-${{ matrix.name }}
-      RUNNER_SCRIPT: ${{ runner.temp }}/qwen_mtp_breakthrough_matrix.py
+      RESULT_DIR: /tmp/qwen-mtp-breakthrough-${{ matrix.name }}
+      RUNNER_SCRIPT: /tmp/qwen_mtp_breakthrough_matrix.py
 
     steps:
       - uses: actions/checkout@v5
