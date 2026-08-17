@@ -27,23 +27,21 @@ jobs:
 
           path = Path(".github/workflows/finalize-ax-sidecar-adoption.yml")
           source = path.read_text()
-          old = (
-              '      AX_SOURCE_DIR="$(AX_REPO="$AX_REPO" python - <<\'PY\'\n'
-              'import os\n'
-              'from huggingface_hub import snapshot_download\n'
-              '\n'
-              'print(snapshot_download(repo_id=os.environ["AX_REPO"]))\n'
-              + 'P' + 'Y\n'
-              ')"\n'
-          )
-          new = (
-              '      AX_SOURCE_DIR="$(AX_REPO="$AX_REPO" python -c '
+          marker = 'AX_SOURCE_DIR="$(AX_REPO="$AX_REPO" python - <<\'PY\''
+          marker_count = source.count(marker)
+          if marker_count != 1:
+              raise SystemExit(f"expected one AX heredoc marker, found {marker_count}")
+          marker_start = source.index(marker)
+          start = source.rfind("\n", 0, marker_start) + 1
+          end_marker = "\n" + "P" + "Y\n)\""
+          end = source.index(end_marker, marker_start) + len(end_marker)
+          indent = source[start:marker_start]
+          replacement = indent + (
+              'AX_SOURCE_DIR="$(AX_REPO="$AX_REPO" python -c '
               '\'import os; from huggingface_hub import snapshot_download; '
-              'print(snapshot_download(repo_id=os.environ["AX_REPO"]))\')"\n'
+              'print(snapshot_download(repo_id=os.environ["AX_REPO"]))\')"'
           )
-          if source.count(old) != 1:
-              raise SystemExit(f"expected one nested heredoc, found {source.count(old)}")
-          path.write_text(source.replace(old, new, 1))
+          path.write_text(source[:start] + replacement + source[end:])
           PY
           rm .github/workflows/repair-finalize-ax-sidecar.yml
           git config user.name 'github-actions[bot]'
