@@ -165,25 +165,20 @@ def mtp_config_depth(config: dict[str, Any]) -> int:
     return int(config.get("mtp_num_hidden_layers", 0) or 0)
 
 
-def iter_weight_keys(model_dir: Path) -> tuple[list[str], list[str]]:
-    index_path = model_dir / "model.safetensors.index.json"
-    referenced_files: list[str] = []
+def iter_loader_weight_keys(model_dir: Path) -> tuple[list[str], list[str]]:
+    """Inspect exactly the files opened by MLX-LM's local-model loader."""
+    files = sorted(model_dir.glob("model*.safetensors"))
+    if not files:
+        raise FileNotFoundError(
+            f"MLX-LM will find no model*.safetensors files in {model_dir}"
+        )
     keys: list[str] = []
-    if index_path.is_file():
-        index = json.loads(index_path.read_text())
-        weight_map = index.get("weight_map", {})
-        if not isinstance(weight_map, dict):
-            raise RuntimeError(f"invalid weight_map in {index_path}")
-        keys.extend(str(key) for key in weight_map)
-        referenced_files.extend(sorted({str(value) for value in weight_map.values()}))
-        return keys, referenced_files
-
-    files = sorted(model_dir.glob("*.safetensors"))
+    loader_files: list[str] = []
     for path in files:
         with safe_open(path, framework="numpy") as handle:
             keys.extend(str(key) for key in handle.keys())
-        referenced_files.append(path.name)
-    return keys, referenced_files
+        loader_files.append(path.name)
+    return keys, loader_files
 
 
 def inspect_model_contract(model_dir: Path) -> dict[str, Any]:
@@ -191,10 +186,10 @@ def inspect_model_contract(model_dir: Path) -> dict[str, Any]:
     if not model_dir.is_dir():
         raise NotADirectoryError(model_dir)
     config = model_config(model_dir)
-    keys, referenced_files = iter_weight_keys(model_dir)
+    keys, loader_files = iter_loader_weight_keys(model_dir)
     mtp_keys = sorted(key for key in keys if "mtp." in key)
-    sidecar = model_dir / "mtp.safetensors"
-    sidecar_referenced = sidecar.name in referenced_files
+    standalone_sidecar = model_dir / "mtp.safetensors"
+    loader_sidecar = model_dir / "model-mtp.safetensors"
     depth = mtp_config_depth(config)
     result = {
         "model_dir": str(model_dir),
@@ -203,9 +198,9 @@ def inspect_model_contract(model_dir: Path) -> dict[str, Any]:
         "weight_key_count": len(keys),
         "mtp_weight_key_count": len(mtp_keys),
         "mtp_weight_key_examples": mtp_keys[:20],
-        "referenced_weight_files": referenced_files,
-        "standalone_mtp_sidecar_present": sidecar.is_file(),
-        "standalone_mtp_sidecar_referenced": sidecar_referenced,
+        "mlx_lm_loader_weight_files": loader_files,
+        "standalone_mtp_sidecar_present": standalone_sidecar.is_file(),
+        "loader_visible_mtp_sidecar_present": loader_sidecar.is_file(),
         "config_sha256": sha256_text(json.dumps(config, sort_keys=True)),
     }
     if depth <= 0:
@@ -215,13 +210,15 @@ def inspect_model_contract(model_dir: Path) -> dict[str, Any]:
         )
     if not mtp_keys:
         detail = ""
-        if sidecar.is_file() and not sidecar_referenced:
+        if standalone_sidecar.is_file() and not loader_sidecar.is_file():
             detail = (
-                " A standalone mtp.safetensors sidecar exists but is not part of "
-                "model.safetensors.index.json; standard mlx-lm loading will ignore it."
+                " A standalone mtp.safetensors sidecar exists, but this MLX-LM "
+                "revision opens only model*.safetensors files. Create the validated "
+                "model-mtp.safetensors alias with the sidecar adopter."
             )
         raise RuntimeError(
-            "the standard model weight map contains no native mtp.* tensors." + detail
+            "the files MLX-LM will actually open contain no native mtp.* tensors."
+            + detail
         )
     return result
 

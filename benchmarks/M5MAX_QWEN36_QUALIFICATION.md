@@ -18,15 +18,16 @@ label “Qwen3.8-27B” should not be used for this run.
 
 ## Model requirement
 
-The model directory must contain native `mtp.*` tensors in the ordinary MLX
-weight map. A standalone engine-specific `mtp.safetensors` file is not enough
-unless it is referenced by `model.safetensors.index.json` with keys matching
-the MLX-LM Qwen MTP module.
+The model directory must expose native `mtp.*` tensors through a file matching
+MLX-LM's local discovery rule, `model*.safetensors`. Updating only
+`model.safetensors.index.json` is not sufficient in this revision. A standalone
+engine-specific `mtp.safetensors` file is therefore ignored unless the validated
+bytes are also exposed through the loader-visible `model-mtp.safetensors` alias.
 
-The harness checks all of this before loading 27B weights and fails closed with
-a specific diagnostic. In particular, the AutomatosX AX Engine packages keep
-the target shards and MTP sidecar separate; standard MLX-LM ignores that
-sidecar, so those directories are not accepted unchanged by this gate.
+The harness inspects exactly the files MLX-LM will open before loading 27B weights
+and fails closed with a specific diagnostic. The AutomatosX AX Engine packages keep
+the target shards and MTP sidecar separate, so those directories are not accepted
+unchanged by this gate; use the included adopter.
 
 The sidecar has now been independently inspected: its 15 BF16 tensors use the
 exact native `mlx-lm#1740` names, dtypes, shapes, and contiguous byte spans. The
