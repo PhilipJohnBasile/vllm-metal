@@ -232,12 +232,8 @@ class Server:
         env = os.environ.copy()
         env.update(
             {
-                "VLLM_METAL_SPEC_VERIFY_WINDOW": str(
-                    int(self.profile.verify_window)
-                ),
-                "VLLM_METAL_DECODE_PIPELINE": str(
-                    int(self.profile.decode_pipeline)
-                ),
+                "VLLM_METAL_SPEC_VERIFY_WINDOW": str(int(self.profile.verify_window)),
+                "VLLM_METAL_DECODE_PIPELINE": str(int(self.profile.decode_pipeline)),
                 "VLLM_METAL_GDN_LAZY_KERNELS": str(int(self.profile.gdn_lazy)),
             }
         )
@@ -446,9 +442,7 @@ class ServingBenchmarker:
                         "elapsed_s": elapsed,
                         "completed_output_tokens": total_output,
                         "output_throughput_tok_s": total_output / elapsed,
-                        "total_token_throughput_tok_s": (
-                            total_input + total_output
-                        )
+                        "total_token_throughput_tok_s": (total_input + total_output)
                         / elapsed,
                         "mean_ttft_ms": statistics.mean(
                             output.ttft * 1000 for output in outputs
@@ -467,8 +461,7 @@ class ServingBenchmarker:
             accepted_tokens = 0
             if metrics_before is not None and metrics_after is not None:
                 draft_tokens = (
-                    metrics_after.num_draft_tokens
-                    - metrics_before.num_draft_tokens
+                    metrics_after.num_draft_tokens - metrics_before.num_draft_tokens
                 )
                 accepted_tokens = (
                     metrics_after.num_accepted_tokens
@@ -479,8 +472,7 @@ class ServingBenchmarker:
                 metric["output_throughput_tok_s"] for metric in repeat_metrics
             ]
             total_rates = [
-                metric["total_token_throughput_tok_s"]
-                for metric in repeat_metrics
+                metric["total_token_throughput_tok_s"] for metric in repeat_metrics
             ]
             result = {
                 "profile": profile.name,
@@ -497,8 +489,7 @@ class ServingBenchmarker:
                 "output_throughput_min_tok_s": min(output_rates),
                 "output_throughput_max_tok_s": max(output_rates),
                 "output_throughput_cv": (
-                    statistics.pstdev(output_rates)
-                    / statistics.mean(output_rates)
+                    statistics.pstdev(output_rates) / statistics.mean(output_rates)
                     if len(output_rates) > 1
                     else 0.0
                 ),
@@ -762,9 +753,7 @@ async def async_main(args: argparse.Namespace) -> int:
                     continue
                 rows.append(result)
                 write_json(
-                    output_dir
-                    / "results"
-                    / f"{profile.name}__{workload.name}.json",
+                    output_dir / "results" / f"{profile.name}__{workload.name}.json",
                     result,
                 )
         finally:

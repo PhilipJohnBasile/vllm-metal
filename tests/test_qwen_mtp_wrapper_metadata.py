@@ -19,9 +19,7 @@ def test_qwen_mtp_metadata_unwraps_language_model() -> None:
         language_model=text_model,
     )
     runner = SimpleNamespace(
-        vllm_config=SimpleNamespace(
-            speculative_config=SimpleNamespace(method="mtp")
-        ),
+        vllm_config=SimpleNamespace(speculative_config=SimpleNamespace(method="mtp")),
         _forward_model=wrapper,
     )
 
@@ -43,9 +41,7 @@ def test_qwen_mtp_metadata_keeps_direct_text_model() -> None:
         args=args,
     )
     runner = SimpleNamespace(
-        vllm_config=SimpleNamespace(
-            speculative_config=SimpleNamespace(method="mtp")
-        ),
+        vllm_config=SimpleNamespace(speculative_config=SimpleNamespace(method="mtp")),
         _forward_model=model,
     )
 
