@@ -344,6 +344,14 @@ class GDNPagedAttentionWrapper(nn.Module):
     def _try_run_conv_one_draft_state_chains(
         self, mixed_qkv: mx.array, state: _GDNForwardState
     ) -> mx.array | None:
+        # The native multi-request two-launch conv chain failed deterministic
+        # request-parity qualification. Keep the C1 latency path, but route C2+
+        # through the exact request/token-sequential implementation until a
+        # real-kernel multi-request regression protects this handoff. The
+        # independent recurrent state chain remains batch-wide.
+        if state.num_requests != 1:
+            return None
+
         slots = self._one_draft_state_chain_slots(state)
         if slots is None:
             return None
@@ -401,9 +409,10 @@ class GDNPagedAttentionWrapper(nn.Module):
     ) -> mx.array:
         """Produce an observable conv-state checkpoint after every token.
 
-        One-draft pure-decode batches use two fused batch-wide decode launches;
-        wider or mixed verification shapes retain the correctness-first
-        request/token-sequential fallback below.
+        A single-request one-draft batch uses two fused decode launches.
+        Multi-request, wider, and mixed verification shapes retain the
+        correctness-first request/token-sequential fallback below; recurrent
+        state still has its independent multi-request batch path.
         """
         fast_path = self._try_run_conv_one_draft_state_chains(mixed_qkv, state)
         if fast_path is not None:
