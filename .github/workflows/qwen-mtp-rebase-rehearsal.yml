@@ -7,6 +7,7 @@ on:
       - handoff-pr-618-20260822
     paths:
       - .github/workflows/qwen-mtp-rebase-rehearsal.yml
+      - tools/resolve_qwen_mtp_rebase_conflicts.py
   pull_request:
     branches:
       - handoff-pr-618-20260822
@@ -42,6 +43,8 @@ jobs:
           git cat-file -e "${INTEGRATION_BASE}^{commit}"
           git cat-file -e "${FEATURE_HEAD}^{commit}"
           git cat-file -e "${UPSTREAM_MAIN}^{commit}"
+          cp tools/resolve_qwen_mtp_rebase_conflicts.py /tmp/resolve_qwen_mtp_rebase_conflicts.py
+          python -m py_compile /tmp/resolve_qwen_mtp_rebase_conflicts.py
 
       - name: Record deterministic overlap inputs
         shell: bash
@@ -63,36 +66,28 @@ jobs:
             "${INTEGRATION_BASE}..${FEATURE_HEAD}" \
             > "${REPORT_DIR}/feature-commits.txt"
 
-      - name: Replay the two feature commits onto current main
+      - name: Replay, resolve known conflicts, and continue both commits
         id: rebase
         shell: bash
         run: |
           set -uo pipefail
-          mkdir -p "${REPORT_DIR}/conflicts"
-          git switch --detach "${FEATURE_HEAD}"
+          mkdir -p \
+            "${REPORT_DIR}/conflicts-first" \
+            "${REPORT_DIR}/conflicts-second" \
+            "${REPORT_DIR}/resolutions"
 
-          set +e
-          git rebase --onto \
-            "${UPSTREAM_MAIN}" \
-            "${INTEGRATION_BASE}" \
-            "${FEATURE_HEAD}" \
-            > "${REPORT_DIR}/rebase.stdout.txt" \
-            2> "${REPORT_DIR}/rebase.stderr.txt"
-          rebase_rc=$?
-          set -e
-
-          echo "${rebase_rc}" > "${REPORT_DIR}/rebase-exit-code.txt"
-          git status --short > "${REPORT_DIR}/status-short.txt" || true
-          git status > "${REPORT_DIR}/status.txt" || true
-          git diff --name-only --diff-filter=U \
-            > "${REPORT_DIR}/conflict-files.txt" || true
-          git ls-files -u > "${REPORT_DIR}/index-unmerged.txt" || true
-          git diff --cc > "${REPORT_DIR}/combined-conflict.diff" || true
-
-          if [ "${rebase_rc}" -ne 0 ]; then
+          capture_conflicts() {
+            local label="$1"
+            local destination="$2"
+            git status --short > "${REPORT_DIR}/status-${label}-short.txt" || true
+            git status > "${REPORT_DIR}/status-${label}.txt" || true
+            git diff --name-only --diff-filter=U \
+              > "${REPORT_DIR}/conflict-files-${label}.txt" || true
+            git ls-files -u > "${REPORT_DIR}/index-unmerged-${label}.txt" || true
+            git diff --cc > "${REPORT_DIR}/combined-conflict-${label}.diff" || true
             while IFS= read -r path; do
               [ -n "${path}" ] || continue
-              safe_path="${REPORT_DIR}/conflicts/${path}"
+              safe_path="${destination}/${path}"
               mkdir -p "$(dirname "${safe_path}")"
               git show ":1:${path}" > "${safe_path}.stage1-base" 2>/dev/null || true
               # During rebase, stage 2 is the new upstream side and stage 3 is
@@ -100,18 +95,81 @@ jobs:
               git show ":2:${path}" > "${safe_path}.stage2-upstream" 2>/dev/null || true
               git show ":3:${path}" > "${safe_path}.stage3-feature" 2>/dev/null || true
               cp "${path}" "${safe_path}.worktree" 2>/dev/null || true
-            done < "${REPORT_DIR}/conflict-files.txt"
-            git rebase --abort || true
-            echo "conflicted" > "${REPORT_DIR}/result.txt"
-          else
-            echo "clean" > "${REPORT_DIR}/result.txt"
+            done < "${REPORT_DIR}/conflict-files-${label}.txt"
+          }
+
+          write_success_report() {
             git rev-parse HEAD > "${REPORT_DIR}/rehearsal-head.txt"
+            git log --format=fuller --reverse \
+              "${UPSTREAM_MAIN}..HEAD" \
+              > "${REPORT_DIR}/rebased-commits.txt"
             git diff --stat "${UPSTREAM_MAIN}..HEAD" \
               > "${REPORT_DIR}/rebased-stat.txt"
             git diff "${UPSTREAM_MAIN}..HEAD" \
               > "${REPORT_DIR}/rebased.patch"
+            git diff --check "${UPSTREAM_MAIN}..HEAD"
+          }
+
+          git switch --detach "${FEATURE_HEAD}"
+
+          set +e
+          git rebase --onto \
+            "${UPSTREAM_MAIN}" \
+            "${INTEGRATION_BASE}" \
+            "${FEATURE_HEAD}" \
+            > "${REPORT_DIR}/rebase-initial.stdout.txt" \
+            2> "${REPORT_DIR}/rebase-initial.stderr.txt"
+          initial_rc=$?
+          set -e
+          echo "${initial_rc}" > "${REPORT_DIR}/rebase-initial-exit-code.txt"
+
+          if [ "${initial_rc}" -eq 0 ]; then
+            echo "clean" > "${REPORT_DIR}/result.txt"
+            write_success_report
+          else
+            capture_conflicts first "${REPORT_DIR}/conflicts-first"
+
+            python /tmp/resolve_qwen_mtp_rebase_conflicts.py \
+              > "${REPORT_DIR}/known-resolution.stdout.txt" \
+              2> "${REPORT_DIR}/known-resolution.stderr.txt"
+
+            cp vllm_metal/attention/impls/gdn_lazy.py \
+              "${REPORT_DIR}/resolutions/gdn_lazy.py.resolved"
+            cp vllm_metal/v1/cache_policy.py \
+              "${REPORT_DIR}/resolutions/cache_policy.py.resolved"
+            diff -u \
+              "${REPORT_DIR}/conflicts-first/vllm_metal/attention/impls/gdn_lazy.py.stage2-upstream" \
+              "${REPORT_DIR}/resolutions/gdn_lazy.py.resolved" \
+              > "${REPORT_DIR}/resolutions/gdn_lazy.upstream-to-resolved.diff" || true
+            diff -u \
+              "${REPORT_DIR}/conflicts-first/vllm_metal/v1/cache_policy.py.stage2-upstream" \
+              "${REPORT_DIR}/resolutions/cache_policy.py.resolved" \
+              > "${REPORT_DIR}/resolutions/cache_policy.upstream-to-resolved.diff" || true
+
+            git add \
+              vllm_metal/attention/impls/gdn_lazy.py \
+              vllm_metal/v1/cache_policy.py
+
+            set +e
+            GIT_EDITOR=true git rebase --continue \
+              > "${REPORT_DIR}/rebase-continue.stdout.txt" \
+              2> "${REPORT_DIR}/rebase-continue.stderr.txt"
+            continue_rc=$?
+            set -e
+            echo "${continue_rc}" > "${REPORT_DIR}/rebase-continue-exit-code.txt"
+
+            if [ "${continue_rc}" -eq 0 ]; then
+              echo "resolved-clean" > "${REPORT_DIR}/result.txt"
+              write_success_report
+            else
+              capture_conflicts second "${REPORT_DIR}/conflicts-second"
+              echo "conflicted-after-known-resolution" > "${REPORT_DIR}/result.txt"
+              git rebase --abort || true
+            fi
           fi
 
+          first_count=$(wc -l < "${REPORT_DIR}/conflict-files-first.txt" 2>/dev/null || echo 0)
+          second_count=$(wc -l < "${REPORT_DIR}/conflict-files-second.txt" 2>/dev/null || echo 0)
           {
             echo "## PR #618 rebase rehearsal"
             echo
@@ -120,9 +178,10 @@ jobs:
             echo "- Upstream main: \`${UPSTREAM_MAIN}\`"
             echo "- Result: \`$(cat "${REPORT_DIR}/result.txt")\`"
             echo "- Overlapping paths: \`$(wc -l < "${REPORT_DIR}/overlap-files.txt" | tr -d ' ')\`"
-            echo "- Unmerged paths: \`$(wc -l < "${REPORT_DIR}/conflict-files.txt" | tr -d ' ')\`"
+            echo "- First-commit conflicts: \`${first_count// /}\`"
+            echo "- Remaining conflicts after guarded resolution: \`${second_count// /}\`"
             echo
-            echo "The uploaded artifact preserves the exact index stages for each conflict."
+            echo "The artifact preserves original index stages, guarded resolutions, and any later conflict stages."
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Validate report completeness
@@ -139,10 +198,32 @@ jobs:
 
           root = Path("/tmp/qwen-mtp-rebase-report")
           result = (root / "result.txt").read_text().strip()
-          if result not in {"clean", "conflicted"}:
+          allowed = {
+              "clean",
+              "resolved-clean",
+              "conflicted-after-known-resolution",
+          }
+          if result not in allowed:
               raise SystemExit(f"unexpected rehearsal result: {result!r}")
-          if result == "conflicted" and not (root / "conflict-files.txt").read_text().strip():
-              raise SystemExit("rebase failed without a recorded unmerged path")
+
+          if result in {"clean", "resolved-clean"}:
+              for name in (
+                  "rehearsal-head.txt",
+                  "rebased-commits.txt",
+                  "rebased-stat.txt",
+                  "rebased.patch",
+              ):
+                  if not (root / name).exists():
+                      raise SystemExit(f"successful rehearsal missing {name}")
+
+          first = root / "conflict-files-first.txt"
+          if result == "resolved-clean" and not first.read_text().strip():
+              raise SystemExit("resolved-clean result lacks first-conflict record")
+
+          if result == "conflicted-after-known-resolution":
+              second = root / "conflict-files-second.txt"
+              if not second.read_text().strip():
+                  raise SystemExit("later rebase failure lacks an unmerged path")
           PY
 
       - name: Upload deterministic rebase report
