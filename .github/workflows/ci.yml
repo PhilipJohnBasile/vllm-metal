@@ -4,7 +4,8 @@ on:
   push:
     branches: [ main ]
   pull_request:
-    branches: [ main ]
+    branches:
+      - validation-base-pr618-211a1e4-20260822
 
 jobs:
   lint:
@@ -15,6 +16,27 @@ jobs:
       matrix:
         os: [macos-15, ubuntu-24.04-arm, ubuntu-24.04]
     
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Lint
+      run: |
+        scripts/lint.sh
+
+  test:
+    runs-on: ${{ matrix.os }}
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        os: [macos-15]
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
