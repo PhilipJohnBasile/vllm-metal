@@ -21,7 +21,7 @@ jobs:
       FIRST_FEATURE_COMMIT: bf59b7c4d912f3aca5f8217b0da1bfd1ed260294
       SECOND_FEATURE_COMMIT: 5c1250161a9de28fa5fd734d922a0df604101eb6
       UPSTREAM_MAIN: 211a1e4bc976cd6c0c961cad8da59d649ea9bd65
-      TARGET_BRANCH: rehearsal-pr-618-on-main-211a1e4-20260822-r1
+      TARGET_BRANCH: rehearsal-pr-618-on-main-211a1e4-20260822-r2
       BENCH_WORKFLOW: .github/workflows/qwen-mtp-serving-bench.yml
     steps:
       - uses: actions/checkout@v5
