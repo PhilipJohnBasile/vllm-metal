@@ -7,6 +7,9 @@ on:
       - handoff-pr-618-20260822
     paths:
       - .github/workflows/qwen-mtp-rebase-rehearsal.yml
+  pull_request:
+    branches:
+      - handoff-pr-618-20260822
 
 permissions:
   contents: read
@@ -32,6 +35,8 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          git config user.name "Philip John Basile"
+          git config user.email "PBasile@Basilecom.com"
           git remote add canonical https://github.com/vllm-project/vllm-metal.git
           git fetch --no-tags canonical "${UPSTREAM_MAIN}"
           git cat-file -e "${INTEGRATION_BASE}^{commit}"
