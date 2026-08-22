@@ -1,9 +1,8 @@
 Temporary same-repository PR trigger for the non-destructive #618 rebase
 rehearsal.
 
-Retry 5: the connector preseeded the exact Qwen MTP benchmark workflow on a
-branch rooted at upstream `211a1e4`. The materializer now replays the two
-feature commits after that seed and fast-forwards the branch without changing a
-workflow file through the Actions token.
+Retry 6: the handoff base now targets the Ruff-clean r2 rehearsal branch and
+uses the corrected one-line `write_conv_rows` resolution. This head update
+forces GitHub to rebuild the PR merge context against base `b38712d`.
 
 This branch contains no implementation change.
