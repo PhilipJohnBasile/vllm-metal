@@ -1,0 +1,2 @@
+Temporary same-repository PR trigger for the non-destructive #618 rebase
+rehearsal. This branch contains no implementation change.
