@@ -1,0 +1,69 @@
+name: Validate exact Qwen MTP PR 618 rehearsal
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - handoff-pr-618-20260822
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-qwen-mtp-rehearsal-r2
+  cancel-in-progress: true
+
+env:
+  REHEARSAL_SHA: 4d4a48c3d3bbc78531041503cae0a7e29759664e
+
+jobs:
+  lint:
+    name: lint rehearsal (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04-arm, ubuntu-24.04]
+    steps:
+      - name: Checkout exact rehearsal tree
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REHEARSAL_SHA }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Verify exact revision
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "${REHEARSAL_SHA}"
+
+      - name: Lint
+        shell: bash
+        run: scripts/lint.sh
+
+  test:
+    name: test rehearsal (macos-15)
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - name: Checkout exact rehearsal tree
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REHEARSAL_SHA }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Verify exact revision
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "${REHEARSAL_SHA}"
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: hf-${{ runner.os }}-${{ hashFiles('scripts/test.sh') }}
+
+      - name: Test
+        shell: bash
+        run: scripts/test.sh
