@@ -1,8 +1,9 @@
 Temporary same-repository PR trigger for the non-destructive #618 rebase
 rehearsal.
 
-Retry 3: the guarded resolver now preserves #634's in-place helper for both
-convolution and recurrent speculative destination writes before continuing the
-second commit.
+Retry 4: trigger the one-shot materializer that rebuilds the validated guarded
+rebase and publishes the uniquely named branch
+`rehearsal-pr-618-on-main-211a1e4-20260822-r1` without force-updating an
+existing ref.
 
 This branch contains no implementation change.
