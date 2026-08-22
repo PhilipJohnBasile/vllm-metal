@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - integration/pr-618-main-20260822
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
@@ -14,13 +17,14 @@ concurrency:
 
 jobs:
   three-way-merge:
-    if: ${{ !contains(github.event.head_commit.message, '[skip integration]') }}
+    if: ${{ github.event_name == 'pull_request' || !contains(github.event.head_commit.message, '[skip integration]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: integration/pr-618-main-20260822
           fetch-depth: 0
           persist-credentials: true
 
@@ -29,6 +33,11 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+
+          target_branch="integration/pr-618-main-20260822"
+          report_dir="/tmp/pr-618-merge-report"
+          rm -rf "$report_dir"
+          mkdir -p "$report_dir"
 
           git config user.name "Philip John Basile"
           git config user.email "PBasile@Basilecom.com"
@@ -40,79 +49,97 @@ jobs:
           pr_head=$(git rev-parse refs/remotes/origin/pr-618-head)
           merge_base=$(git merge-base HEAD refs/remotes/origin/pr-618-head)
 
-          mkdir -p merge-artifacts docs
-
           set +e
           git merge --no-commit --no-ff refs/remotes/origin/pr-618-head \
-            >merge-artifacts/merge.stdout 2>merge-artifacts/merge.stderr
+            >"$report_dir/merge.stdout" 2>"$report_dir/merge.stderr"
           merge_status=$?
           set -e
 
           conflicts=$(git diff --name-only --diff-filter=U || true)
-          conflict_count=$(printf '%s\n' "$conflicts" | sed '/^$/d' | wc -l | tr -d ' ')
+          printf '%s\n' "$conflicts" | sed '/^$/d' >"$report_dir/conflicts.txt"
+          conflict_count=$(wc -l <"$report_dir/conflicts.txt" | tr -d ' ')
 
-          git status --porcelain=v2 >merge-artifacts/status-porcelain-v2.txt || true
-          git ls-files -u >merge-artifacts/unmerged-index.txt || true
-          git diff --cc >merge-artifacts/conflicts.diff || true
+          git status --porcelain=v2 >"$report_dir/status-porcelain-v2.txt" || true
+          git ls-files -u >"$report_dir/unmerged-index.txt" || true
+          git diff --cc >"$report_dir/conflicts.diff" || true
 
-          {
-            echo "# PR #618 three-way integration report"
-            echo
-            echo "Generated automatically on $(date -u +'%Y-%m-%dT%H:%M:%SZ')."
-            echo
-            echo "- Integration head before merge: \`$integration_head\`"
-            echo "- Preserved PR #618 head: \`$pr_head\`"
-            echo "- Computed merge base: \`$merge_base\`"
-            echo "- Raw merge exit status: \`$merge_status\`"
-            echo "- Unmerged path count: **$conflict_count**"
-            echo
-            if [ "$merge_status" -eq 0 ] && [ "$conflict_count" -eq 0 ]; then
-              echo "## Result"
-              echo
-              echo "The merge completed without unresolved paths. The workflow will commit"
-              echo "the resulting merge tree to the integration branch."
-            else
-              echo "## Unresolved paths"
-              echo
-              if [ "$conflict_count" -eq 0 ]; then
-                echo "The merge command failed without leaving unmerged index entries."
-                echo "See the captured stdout/stderr artifact."
-              else
-                while IFS= read -r path; do
-                  [ -n "$path" ] && echo "- \`$path\`"
-                done <<< "$conflicts"
-              fi
-              echo
-              echo "The integration branch remains based on current main plus the already"
-              echo "transplanted non-conflicting #618 blobs. No conflict-marker files are"
-              echo "committed. The full combined diff and index stages are uploaded as the"
-              echo "workflow artifact \`pr-618-merge-report\`."
-            fi
-          } >docs/pr_618_merge_report_20260822.md
-
-          python - <<PY
+          REPORT_DIR="$report_dir" \
+          INTEGRATION_HEAD="$integration_head" \
+          PR_HEAD="$pr_head" \
+          MERGE_BASE="$merge_base" \
+          MERGE_STATUS="$merge_status" \
+          python - <<'PY'
           import json
+          import os
+          from datetime import datetime, timezone
           from pathlib import Path
 
+          report_dir = Path(os.environ["REPORT_DIR"])
           conflicts = [
-              line for line in ${conflicts@Q}.splitlines() if line
+              line
+              for line in (report_dir / "conflicts.txt").read_text().splitlines()
+              if line
           ]
+          generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+          merge_status = int(os.environ["MERGE_STATUS"])
+
           report = {
               "schema_version": 1,
-              "generated_at": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
-              "integration_head": "$integration_head",
-              "pr_head": "$pr_head",
-              "merge_base": "$merge_base",
-              "merge_exit_status": $merge_status,
+              "generated_at": generated_at,
+              "integration_head": os.environ["INTEGRATION_HEAD"],
+              "pr_head": os.environ["PR_HEAD"],
+              "merge_base": os.environ["MERGE_BASE"],
+              "merge_exit_status": merge_status,
               "conflict_count": len(conflicts),
               "conflicts": conflicts,
           }
-          Path("docs/pr_618_merge_report_20260822.json").write_text(
+          (report_dir / "pr_618_merge_report_20260822.json").write_text(
               json.dumps(report, indent=2, sort_keys=True) + "\n"
+          )
+
+          lines = [
+              "# PR #618 three-way integration report",
+              "",
+              f"Generated automatically on {generated_at}.",
+              "",
+              f"- Integration head before merge: `{report['integration_head']}`",
+              f"- Preserved PR #618 head: `{report['pr_head']}`",
+              f"- Computed merge base: `{report['merge_base']}`",
+              f"- Raw merge exit status: `{merge_status}`",
+              f"- Unmerged path count: **{len(conflicts)}**",
+              "",
+          ]
+          if merge_status == 0 and not conflicts:
+              lines += [
+                  "## Result",
+                  "",
+                  "The merge completed without unresolved paths. The resulting",
+                  "merge tree is committed to the integration branch.",
+              ]
+          else:
+              lines += ["## Unresolved paths", ""]
+              if conflicts:
+                  lines.extend(f"- `{path}`" for path in conflicts)
+              else:
+                  lines += [
+                      "The merge failed without leaving unmerged index entries.",
+                      "See the captured stdout and stderr files.",
+                  ]
+              lines += [
+                  "",
+                  "No conflict-marker files are committed. The full combined diff,",
+                  "unmerged index stages, and merge output are retained in the",
+                  "`pr-618-merge-report` workflow artifact.",
+              ]
+          (report_dir / "pr_618_merge_report_20260822.md").write_text(
+              "\n".join(lines) + "\n"
           )
           PY
 
           if [ "$merge_status" -eq 0 ] && [ "$conflict_count" -eq 0 ]; then
+            mkdir -p docs
+            cp "$report_dir/pr_618_merge_report_20260822.md" docs/
+            cp "$report_dir/pr_618_merge_report_20260822.json" docs/
             git add docs/pr_618_merge_report_20260822.md \
               docs/pr_618_merge_report_20260822.json
             git commit -m "merge: integrate PR #618 onto current main
@@ -123,6 +150,9 @@ Signed-off-by: Philip John Basile <PBasile@Basilecom.com>"
             echo "clean=true" >>"$GITHUB_OUTPUT"
           else
             git merge --abort || true
+            mkdir -p docs
+            cp "$report_dir/pr_618_merge_report_20260822.md" docs/
+            cp "$report_dir/pr_618_merge_report_20260822.json" docs/
             git add docs/pr_618_merge_report_20260822.md \
               docs/pr_618_merge_report_20260822.json
             git commit -m "docs: record PR #618 three-way merge conflicts [skip integration]
@@ -133,12 +163,12 @@ Signed-off-by: Philip John Basile <PBasile@Basilecom.com>"
             echo "clean=false" >>"$GITHUB_OUTPUT"
           fi
 
-          git push origin HEAD:integration/pr-618-main-20260822
+          git push origin HEAD:"$target_branch"
 
       - name: Upload exact merge diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pr-618-merge-report
-          path: merge-artifacts
+          path: /tmp/pr-618-merge-report
           if-no-files-found: warn
