@@ -1,0 +1,8 @@
+Temporary same-repository PR trigger for the non-destructive #618 rebase
+rehearsal.
+
+Retry 7: trigger the exact-r2 validation workflow. Every matrix job checks out
+`4d4a48c3d3bbc78531041503cae0a7e29759664e` directly, independent of the PR
+merge tree, fork `main`, and live #618.
+
+This branch contains no implementation change.
