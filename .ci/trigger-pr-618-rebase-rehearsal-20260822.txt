@@ -1,2 +1,8 @@
 Temporary same-repository PR trigger for the non-destructive #618 rebase
-rehearsal. This branch contains no implementation change.
+rehearsal.
+
+Retry 2: the base workflow now applies guarded semantic resolutions for the
+`gdn_lazy.py` and `cache_policy.py` first-commit conflicts, then continues the
+second commit.
+
+This branch contains no implementation change.
