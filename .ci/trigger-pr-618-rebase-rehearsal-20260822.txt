@@ -1,9 +1,9 @@
 Temporary same-repository PR trigger for the non-destructive #618 rebase
 rehearsal.
 
-Retry 4: trigger the one-shot materializer that rebuilds the validated guarded
-rebase and publishes the uniquely named branch
-`rehearsal-pr-618-on-main-211a1e4-20260822-r1` without force-updating an
-existing ref.
+Retry 5: the connector preseeded the exact Qwen MTP benchmark workflow on a
+branch rooted at upstream `211a1e4`. The materializer now replays the two
+feature commits after that seed and fast-forwards the branch without changing a
+workflow file through the Actions token.
 
 This branch contains no implementation change.
