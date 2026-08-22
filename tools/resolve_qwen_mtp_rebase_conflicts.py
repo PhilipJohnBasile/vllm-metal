@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Resolve the two known first-commit conflicts in the PR #618 rehearsal.
+"""Resolve and harden the known PR #618 rebase seam.
 
 This is intentionally narrow. It applies only when Git has stopped while
 replaying ``bf59b7c`` onto vLLM Metal main after #630/#634. Every conflict side
-is checked for the expected semantic anchors before the worktree is modified.
+and the one adjacent non-conflicting state-write seam are checked against exact
+semantic anchors before the worktree is modified.
 
 Resolutions:
 
-* ``gdn_lazy.py`` keeps #634's in-place row writer and #618's distinct
-  speculative destination slots.
+* ``gdn_lazy.py`` keeps #634's in-place row writers and #618's distinct
+  speculative destination slots for both convolution and recurrent state.
 * ``cache_policy.py`` keeps #630's scheduler-managed draft-model specs and then
   prepends #618's Qwen MTP cache-only specs, preserving the MTP grouping
   invariant.
@@ -57,12 +58,38 @@ def _resolve_gdn(path: Path) -> None:
     if "state_cache.store_conv_state(cache_idx, state_pool)" not in theirs:
         raise ResolutionError("feature gdn side lost stable-pool publication")
 
-    resolved = (
+    conv_resolved = (
         "        state_cache.write_conv_rows(\n"
         "            cache_idx, conv_state_updates, write_slot_ids_arr\n"
         "        )\n"
     )
-    path.write_text(prefix + resolved + suffix, encoding="utf-8")
+    text = prefix + conv_resolved + suffix
+
+    # This adjacent feature hunk does not text-conflict with #634, but retaining
+    # the old indexed assignment would reintroduce a whole-pool copy whenever a
+    # speculative recurrent checkpoint is materialized. Preserve #634's helper
+    # contract explicitly.
+    recurrent_old = (
+        "        if materialize_update:\n"
+        "            state_pool = state_cache.recurrent_states[request.cache_idx]\n"
+        "            state_pool[write_slot_ids_arr] = state_updates\n"
+        "            state_cache.store_recurrent_state(request.cache_idx, state_pool)\n"
+    )
+    recurrent_new = (
+        "        if materialize_update:\n"
+        "            state_cache.write_recurrent_rows(\n"
+        "                request.cache_idx, state_updates, write_slot_ids_arr\n"
+        "            )\n"
+    )
+    if text.count(recurrent_old) != 1:
+        raise ResolutionError(
+            "expected exactly one speculative recurrent direct-write seam"
+        )
+    text = text.replace(recurrent_old, recurrent_new, 1)
+
+    if "state_pool[write_slot_ids_arr]" in text:
+        raise ResolutionError("direct speculative state-pool write remains")
+    path.write_text(text, encoding="utf-8")
 
 
 def _resolve_cache_policy(path: Path) -> None:
