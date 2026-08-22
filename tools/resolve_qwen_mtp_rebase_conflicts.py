@@ -59,9 +59,8 @@ def _resolve_gdn(path: Path) -> None:
         raise ResolutionError("feature gdn side lost stable-pool publication")
 
     conv_resolved = (
-        "        state_cache.write_conv_rows(\n"
-        "            cache_idx, conv_state_updates, write_slot_ids_arr\n"
-        "        )\n"
+        "        state_cache.write_conv_rows(cache_idx, conv_state_updates, "
+        "write_slot_ids_arr)\n"
     )
     text = prefix + conv_resolved + suffix
 
