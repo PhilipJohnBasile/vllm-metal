@@ -1,0 +1,190 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-08-22",
+  "live_pull_request": {
+    "repository": "vllm-project/vllm-metal",
+    "number": 618,
+    "url": "https://github.com/vllm-project/vllm-metal/pull/618",
+    "draft": true,
+    "mergeable_at_handoff": false,
+    "head": "5c1250161a9de28fa5fd734d922a0df604101eb6",
+    "branch": "PhilipJohnBasile:pr/610-05-paged-qwen-mtp-prefix",
+    "integration_base": "150dd3292bd940f2eac1b3442ece21355d8ebf19",
+    "integration_base_pr": 620,
+    "changed_files": 22,
+    "signed_off_commits": 2
+  },
+  "vllm_metal_main_at_handoff": {
+    "sha": "acce6140320fc90482b9fe80d3f4b9573c171595",
+    "commits_ahead_of_integration_base": 9,
+    "latest_relevant_pr": 634
+  },
+  "archives": {
+    "downstream": {
+      "repository": "PhilipJohnBasile/vllm-metal",
+      "branch": "archive-pr-618-pre-vacation-20260822",
+      "sha": "5c1250161a9de28fa5fd734d922a0df604101eb6"
+    },
+    "closed_upstream_source": {
+      "repository": "PhilipJohnBasile/mlx-lm",
+      "branch": "archive-1740-final-20260822",
+      "sha": "bc1d11414c12372cdf76538e09ce1fbc54b7fc7b"
+    }
+  },
+  "upstream_dependency": {
+    "repository": "ml-explore/mlx-lm",
+    "closed_pr": 1740,
+    "active_pr": 990,
+    "active_head_at_handoff": "e8ceeccf118d4a089e22431f28f89d5ffe7d9d2b",
+    "active_branch": "AirRunner:feat/mtp-native",
+    "satisfied_by": "reviewed native Qwen MTP implementation landed on mlx-lm/main",
+    "do_not_pin": [
+      "temporary pull-request head",
+      "closed #1740 fork head as production dependency",
+      "synthetic GitHub merge ref"
+    ],
+    "possible_landed_interface": "make_draft_model passed to speculative_generate_step",
+    "downstream_current_contracts": [
+      "supports_mtp",
+      "mtp_forward",
+      "return_hidden=True returns pre-final-norm hidden states",
+      "direct trained-MTP-module access for scheduler-owned paged KV"
+    ]
+  },
+  "hardening_carry_forward": {
+    "source_sha": "bc1d11414c12372cdf76538e09ce1fbc54b7fc7b",
+    "source_pr": 1740,
+    "behaviors": [
+      "transactional multi-turn prompt-cache state",
+      "output-limit finalization",
+      "generator-close finalization",
+      "fail-closed populated-cache boundary validation",
+      "cached-versus-uncached multi-turn parity",
+      "prompt-cache serialization round trip",
+      "accepted draft exposes target/verifier log-probability distribution",
+      "usable loaded-MTP-head detection",
+      "stateful logits-processor rejection",
+      "supported stateless logits-processor parity"
+    ],
+    "non_pr_handoff_branch": "PhilipJohnBasile/mlx-lm:handoff-mtp-native-hardening-20260822",
+    "tests_first_file": "tests/test_mtp_hardening_handoff.py",
+    "static_marker_check": "tools/check_mtp_hardening_markers.py"
+  },
+  "dependency_pins_to_replace_after_landing": [
+    {
+      "path": "pyproject.toml",
+      "current_sha": "254d153fdeb6f150edd4fc5a54f9828638481fa8",
+      "replacement": "exact commit present on ml-explore/mlx-lm:main"
+    },
+    {
+      "path": ".github/workflows/qwen-mtp-serving-bench.yml",
+      "current_sha": "ac6aaffd8fdfb8c8e713e17f155d83e3d72b0a0f",
+      "current_repository": "PhilipJohnBasile/mlx-lm",
+      "replacement_repository": "ml-explore/mlx-lm",
+      "replacement": "same exact landed main commit"
+    }
+  ],
+  "overlap_conflicts": [
+    {
+      "path": "vllm_metal/v1/cache_policy.py",
+      "upstream_prs": [630],
+      "risk": "highest",
+      "preserve": [
+        "scheduler-managed committed draft-model KV",
+        "draft scratch reservation",
+        "combined target and draft block accounting",
+        "Qwen cache-only MTP group",
+        "Qwen auxiliary storage counted exactly once"
+      ]
+    },
+    {
+      "path": "vllm_metal/v1/model_runner.py",
+      "upstream_prs": [630],
+      "risk": "highest",
+      "preserve": [
+        "RequestState.num_computed_tokens",
+        "current DraftModelProposer construction",
+        "separate QwenNativeMTPProposer path",
+        "target hidden-state capture",
+        "verifier-selected GDN-state promotion before scheduler ownership advances"
+      ]
+    },
+    {
+      "path": "vllm_metal/attention/impls/gdn_lazy.py",
+      "upstream_prs": [632, 634],
+      "risk": "highest",
+      "preserve": [
+        "barrier-free lazy prefill",
+        "write_conv_rows and write_recurrent_rows",
+        "separate speculative source and destination slots",
+        "concurrency-2-plus exact speculative convolution path"
+      ]
+    },
+    {
+      "path": "vllm_metal/attention/impls/linear.py",
+      "upstream_prs": [632, 634],
+      "risk": "highest",
+      "preserve": [
+        "upstream lazy policy",
+        "per-token speculative checkpoint metadata",
+        "no restored per-layer mx.eval barriers"
+      ]
+    },
+    {
+      "path": "vllm_metal/attention/context.py",
+      "upstream_prs": [623],
+      "risk": "medium",
+      "preserve": [
+        "M5 NAX ordinary prefill routing",
+        "native MTP verification stays on non-NAX verification path"
+      ]
+    },
+    {
+      "path": "vllm_metal/platform.py",
+      "upstream_prs": [633],
+      "risk": "medium",
+      "preserve": [
+        "UniProc VLLM_HOST_IP loopback compatibility",
+        "native-MTP validation after upstream config validation"
+      ]
+    },
+    {
+      "path": "tests/test_gdn_lazy_wrapper.py",
+      "upstream_prs": [632, 634],
+      "risk": "medium",
+      "preserve": [
+        "lazy no-materialization expectations",
+        "speculative destination-state cases"
+      ]
+    },
+    {
+      "path": "tests/test_v1_model_runner_generate.py",
+      "upstream_prs": [630],
+      "risk": "medium",
+      "preserve": [
+        "current request-state fixtures",
+        "scheduler-managed draft setup",
+        "Qwen native-MTP assertions"
+      ]
+    }
+  ],
+  "ready_for_review_gates": [
+    "native Qwen MTP lands on mlx-lm/main",
+    "#1740 hardening behaviors and focused tests verified in landed implementation",
+    "#618 adapted to canonical landed MLX-LM API",
+    "semantic rebase onto current vllm-metal main",
+    "#630, #632, #633, and #634 contracts preserved",
+    "production and benchmark MLX-LM pins updated to exact landed SHA",
+    "focused tests pass",
+    "repository-wide non-slow suite and static gates pass",
+    "native extension and Metal shader builds pass",
+    "physical M5 Max 4-request parity passes at 48 and 128 output tokens",
+    "clean cancellation, shutdown, and listener release pass",
+    "branch squashed to one signed-off commit"
+  ],
+  "vacation": {
+    "starts": "2026-08-26",
+    "possible_off_grid_duration_days": 14,
+    "authorization": "AirRunner and maintainers may continue upstream review and carry-forward work without waiting for Philip"
+  }
+}
