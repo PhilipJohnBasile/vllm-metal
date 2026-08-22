@@ -1,8 +1,8 @@
 Temporary same-repository PR trigger for the non-destructive #618 rebase
 rehearsal.
 
-Retry 2: the base workflow now applies guarded semantic resolutions for the
-`gdn_lazy.py` and `cache_policy.py` first-commit conflicts, then continues the
+Retry 3: the guarded resolver now preserves #634's in-place helper for both
+convolution and recurrent speculative destination writes before continuing the
 second commit.
 
 This branch contains no implementation change.
