@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
+      - validation-pr618-r2-on-main-211a1e4-20260822
   pull_request:
     branches: [ main ]
 
