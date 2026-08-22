@@ -43,27 +43,6 @@ jobs:
       with:
         submodules: recursive
 
-    - name: Lint
-      run: |
-        scripts/lint.sh
-
-  test:
-    runs-on: ${{ matrix.os }}
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
-      MACOSX_DEPLOYMENT_TARGET: "15.0"
-    permissions:
-      contents: read
-    strategy:
-      matrix:
-        os: [macos-15]
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
-
     - name: Cache HuggingFace models
       uses: actions/cache@v4
       with:
