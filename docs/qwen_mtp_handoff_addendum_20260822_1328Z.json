@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-22T13:28:48Z",
+  "live_pull_request": {
+    "repository": "vllm-project/vllm-metal",
+    "number": 618,
+    "head": "5c1250161a9de28fa5fd734d922a0df604101eb6",
+    "draft": true,
+    "changed_files": 22
+  },
+  "integration_base": {
+    "sha": "150dd3292bd940f2eac1b3442ece21355d8ebf19",
+    "pull_request": 620
+  },
+  "vllm_metal_main": {
+    "sha": "211a1e4bc976cd6c0c961cad8da59d649ea9bd65",
+    "commits_ahead_of_integration_base": 11,
+    "latest_commit_pull_request": 636
+  },
+  "new_upstream_change": {
+    "pull_request": 636,
+    "summary": "skip re-ingesting accepted draft tokens whose KV lookahead already wrote",
+    "direct_overlap_with_pr_618_changed_files": false,
+    "design_constraints": [
+      "committed draft KV is scheduler managed",
+      "speculative KV reuse requires matching committed token identity",
+      "speculative KV reuse requires unchanged physical block lineage",
+      "rejection, scratch placement, reallocation, and stale state fail closed",
+      "the final committed row remains executable so the next draft can be produced"
+    ]
+  },
+  "highest_risk_direct_merges": [
+    {
+      "paths": [
+        "vllm_metal/v1/cache_policy.py",
+        "vllm_metal/v1/model_runner.py"
+      ],
+      "upstream_pull_requests": [630]
+    },
+    {
+      "paths": [
+        "vllm_metal/attention/impls/gdn_lazy.py",
+        "vllm_metal/attention/impls/linear.py"
+      ],
+      "upstream_pull_requests": [632, 634]
+    },
+    {
+      "paths": ["vllm_metal/attention/context.py"],
+      "upstream_pull_requests": [623]
+    },
+    {
+      "paths": ["vllm_metal/platform.py"],
+      "upstream_pull_requests": [633]
+    }
+  ],
+  "new_rebase_acceptance": [
+    "validate token identity and physical block lineage before speculative KV reuse",
+    "fail closed on rejection, scratch placement, reallocation, preemption, cancellation, and request-id reuse",
+    "never skip the final committed row required to generate the next draft",
+    "include Qwen MTP cache groups and auxiliary state in scheduler and worker memory budgets"
+  ],
+  "live_branch_mutated": false,
+  "permanent_pin_target": false
+}
