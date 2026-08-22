@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "report_kind": "exact_change_set_intersection_and_blob_identity",
+  "generated_at": "2026-08-22",
+  "notes": [
+    "This is not a fabricated git textual-conflict transcript.",
+    "The unresolved set is the exact intersection of PR #618 paths and paths changed upstream after the original integration base.",
+    "All clean transplants use the exact PR #618 blob.",
+    "All pending overlap paths intentionally retain the current-main blob until semantically resolved."
+  ],
+  "revisions": {
+    "original_integration_base": "150dd3292bd940f2eac1b3442ece21355d8ebf19",
+    "preserved_pr_head": "5c1250161a9de28fa5fd734d922a0df604101eb6",
+    "current_upstream_main": "211a1e4bc976cd6c0c961cad8da59d649ea9bd65",
+    "integration_head_before_report": "14df9c57fe672ccf4ba1751d830036b5714fd9a0",
+    "upstream_commits_after_base": 11,
+    "integration_branch": "integration/pr-618-main-20260822"
+  },
+  "progress": {
+    "total_pr_files": 22,
+    "exact_clean_transplants": 14,
+    "pending_semantic_overlaps": 8,
+    "dependency_pin_changed": false,
+    "live_pr_branch_rewritten": false,
+    "runtime_validation_complete": false
+  },
+  "clean_transplants": [
+    {"path": ".github/workflows/qwen-mtp-serving-bench.yml", "pr_blob": "9a2a29f74a352b2a4d4a4ff0412ff478415c79e5"},
+    {"path": "benchmarks/qwen_mtp_speed_matrix.py", "pr_blob": "9f21c7f3dec72548a52017b7336985b4b4c9c71a"},
+    {"path": "benchmarks/results/qwen_mtp_copyless_promotion_20260817.md", "pr_blob": "c139f5a3a53bbbab893cb433e29d739d0d646564"},
+    {"path": "tests/attention/test_align_gdn_state_manager.py", "pr_blob": "12bddf505a7ee8730882e9cfdcce438d74ede6b5"},
+    {"path": "tests/test_qwen_mtp_paged_cache.py", "pr_blob": "4c23ae1c4f9c75696ae3ea577e247994cf29ab48"},
+    {"path": "tests/test_qwen_mtp_worker_budget.py", "pr_blob": "cace88eaf011ff222363bb0127d32d863b264239"},
+    {"path": "tests/test_qwen_mtp_wrapper_metadata.py", "pr_blob": "0a5ce010ccd1d433220b3afe7bd829b1e94765b8"},
+    {"path": "tests/test_qwen_native_mtp_proposer.py", "pr_blob": "2781db17abf098a8a41863c486001f50e2656b93"},
+    {"path": "vllm_metal/attention/runtime/hybrid.py", "pr_blob": "c04a9cf23181216586b317aa1ea672aba262fc42"},
+    {"path": "vllm_metal/attention/state/align.py", "pr_blob": "437f20945fd6eb11152b6e43833306e3d8005912"},
+    {"path": "vllm_metal/v1/model_adapter.py", "pr_blob": "85ae0637d34eeea9d59b24988bffcffeaaf542c6"},
+    {"path": "vllm_metal/v1/proposer.py", "pr_blob": "7b3fc43a3020d273abfc27b46ce53b529562198f"},
+    {"path": "vllm_metal/v1/qwen_mtp_paged.py", "pr_blob": "42cb88ca95612d6047fcf86e0053651de7f62612"},
+    {"path": "vllm_metal/v1/spec_decode.py", "pr_blob": "a988cb84cf3b4962abb90a6b909e4a85852ff7a5"}
+  ],
+  "pending_semantic_overlaps": [
+    {
+      "path": "tests/test_gdn_lazy_wrapper.py",
+      "current_main_blob": "b9edddc333621e3d1ea5d25ac01d23fda0f48914",
+      "pr_blob": "65b14e3aa9b05f2e78cd7c7e6131afb8dbc93bbd",
+      "resolution": "retain upstream lazy-prefill and in-place-scatter expectations; add speculative destination coverage"
+    },
+    {
+      "path": "tests/test_v1_model_runner_generate.py",
+      "current_main_blob": "c3658280884a14efefca7ffee8478918412c7c1e",
+      "pr_blob": "06103a3e5c5031643cf6a80de6bce68e5c4019e2",
+      "resolution": "retain current draft-model and sampling regressions; add Qwen native-MTP hidden-state and commit-path coverage"
+    },
+    {
+      "path": "vllm_metal/attention/context.py",
+      "current_main_blob": "f7616981ccd6b861299ec8500e7231978fa2f85c",
+      "pr_blob": "1ba4c7ae0ad2d602ed129d23d51a5f472dfa9da2",
+      "resolution": "preserve NAX routing and hybrid verification-window checkpoint layout"
+    },
+    {
+      "path": "vllm_metal/attention/impls/gdn_lazy.py",
+      "current_main_blob": "a65cfcda75308d27e4e16d0f9172ad3ff24c2da6",
+      "pr_blob": "566fcdfed0acaa4327204c20238fc2a2a640cca7",
+      "resolution": "preserve lazy prefill and in-place row scatter; route source/destination writes through cache helpers"
+    },
+    {
+      "path": "vllm_metal/attention/impls/linear.py",
+      "current_main_blob": "50f8bb9cd6c60c591ab45556075e48c20a1c5c19",
+      "pr_blob": "97e110b955d64731b64582c14abb4ecfc94cca96",
+      "resolution": "preserve removal of materialization barriers while threading speculative metadata"
+    },
+    {
+      "path": "vllm_metal/platform.py",
+      "current_main_blob": "cfaebbb7ed5c811c088a4008957a7643a6c6d079",
+      "pr_blob": "366a086541b800bca2e2d259058e741af6b17a8b",
+      "resolution": "retain UniProc loopback and add native-Qwen-MTP validation"
+    },
+    {
+      "path": "vllm_metal/v1/cache_policy.py",
+      "current_main_blob": "1692a59dce58e94dad3443d1d1bbf00de27f767f",
+      "pr_blob": "72aed78f5f0c859f67e2b333864a22ced8169974",
+      "resolution": "extend scheduler-managed cache design with Qwen MTP group and auxiliary accounting without double counting"
+    },
+    {
+      "path": "vllm_metal/v1/model_runner.py",
+      "current_main_blob": "2affefda8c94c0311ea0cf90706be650b9822d67",
+      "pr_blob": "2c18a5b26a28e9c777590261876d2595e0184469",
+      "resolution": "retain current proposer lifecycle and sampling behavior; add Qwen proposer, hidden capture, and GDN promotion"
+    }
+  ],
+  "must_preserve_upstream_prs": [623, 630, 632, 633, 634, 636],
+  "validation": [
+    "python tools/check_pr618_integration_state.py --require-resolved",
+    "git diff --check",
+    "ruff lint and format",
+    "mypy",
+    "focused Qwen MTP, GDN, cache-policy, model-runner, and tensor-bridge tests",
+    "repository-wide non-slow suite",
+    "physical M5 Max four-request parity at 48 and 128 generated tokens"
+  ]
+}
