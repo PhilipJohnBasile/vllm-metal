@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   ab:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 120
     env:
       MODEL_DIR: /tmp/Qwen3.5-0.8B-4bit-mtp
@@ -161,6 +161,7 @@ jobs:
           from pathlib import Path
 
           root = Path(os.environ['RESULT_DIR'])
+          root.mkdir(parents=True, exist_ok=True)
           paths = {
               'cache_off': root / 'cache-off.json',
               'control': root / 'cache-on-control.json',
