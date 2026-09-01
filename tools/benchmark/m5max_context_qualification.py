@@ -25,9 +25,10 @@ import json
 import platform
 import statistics
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 import aiohttp
 from transformers import AutoTokenizer
