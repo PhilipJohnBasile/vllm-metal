@@ -36,9 +36,10 @@ import argparse
 import hashlib
 import json
 import struct
+from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 # These values should be transported out-of-band or appended in the changing
 # suffix. Matching is case-insensitive and applies at any mapping depth.
@@ -239,7 +240,9 @@ def first_structural_diff(
 
 
 def common_prefix_length(left: Sequence[int], right: Sequence[int]) -> int:
-    for index, (left_token, right_token) in enumerate(zip(left, right)):
+    for index, (left_token, right_token) in enumerate(
+        zip(left, right, strict=False)
+    ):
         if left_token != right_token:
             return index
     return min(len(left), len(right))
