@@ -33,6 +33,11 @@ def _base_config(**cache_overrides) -> SimpleNamespace:
             distributed_executor_backend="auto",
             pipeline_parallel_size=1,
             tensor_parallel_size=1,
+            data_parallel_size=1,
+            data_parallel_size_local=1,
+            data_parallel_backend="mp",
+            data_parallel_external_lb=False,
+            data_parallel_hybrid_lb=False,
             disable_custom_all_reduce=False,
         ),
         cache_config=cache_config,
@@ -49,10 +54,13 @@ def _base_config(**cache_overrides) -> SimpleNamespace:
         scheduler_config=SimpleNamespace(
             async_scheduling=False,
             enable_chunked_prefill=True,
+            long_prefill_token_threshold=0,
             max_num_batched_tokens=2048,
             max_num_scheduled_tokens=None,
         ),
+        additional_config={},
         kv_transfer_config=None,
+        lora_config=None,
     )
 
 
