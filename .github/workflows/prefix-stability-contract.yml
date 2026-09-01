@@ -1,0 +1,41 @@
+name: Prefix Stability Contract
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [perf/prefix-stability-contract]
+    paths:
+      - tools/prefix_stability.py
+      - tests/test_prefix_stability_tool.py
+      - docs/prefix-stability-contract.md
+      - .github/workflows/prefix-stability-contract.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Compile and run self-contained tests
+        run: |
+          python -m py_compile tools/prefix_stability.py tests/test_prefix_stability_tool.py
+          python - <<'PY'
+          import runpy
+
+          namespace = runpy.run_path('tests/test_prefix_stability_tool.py')
+          tests = sorted(
+              (name, value)
+              for name, value in namespace.items()
+              if name.startswith('test_') and callable(value)
+          )
+          for name, test in tests:
+              print(f'RUN {name}', flush=True)
+              test()
+          print(f'{len(tests)} prefix-stability tests passed', flush=True)
+          PY
