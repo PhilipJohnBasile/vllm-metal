@@ -32,6 +32,7 @@ jobs:
       VLLM_METAL_MEMORY_FRACTION: auto
       VLLM_METAL_GDN_LAZY_KERNELS: "1"
       VLLM_METAL_DECODE_PIPELINE: "1"
+      VLLM_METAL_DISABLE_NAX: "1"
       VLLM_ENABLE_V1_MULTIPROCESSING: "0"
       GLOO_SOCKET_IFNAME: lo0
 
@@ -68,7 +69,11 @@ jobs:
             "git+https://github.com/PhilipJohnBasile/mlx-lm@${MLX_LM_MTP_SHA}"
           source scripts/lib.sh
           ensure_metal_toolchain
-          build_native_artifacts
+          # Hosted macOS 15 runners do not provide the macOS 26.2 SDK needed
+          # for the optional M5 NAX artifact. This profile exercises GDN cache
+          # scaling, so build the required native artifacts and use the normal
+          # non-NAX prefill fallback.
+          python -m vllm_metal.metal.build
           python - <<'PY'
           import platform
           import torch
@@ -119,6 +124,7 @@ jobs:
           from pathlib import Path
 
           root = Path(os.environ['RESULT_DIR'])
+          root.mkdir(parents=True, exist_ok=True)
           off_path = root / 'cache-off.json'
           on_path = root / 'cache-on.json'
           if not off_path.exists() or not on_path.exists():
