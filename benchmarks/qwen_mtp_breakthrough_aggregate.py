@@ -144,9 +144,7 @@ def main() -> int:
                     statistics.geometric_mean(speedups) if speedups else None
                 ),
                 "geomean_gain_vs_mtp_current": (
-                    statistics.geometric_mean(current_gains)
-                    if current_gains
-                    else None
+                    statistics.geometric_mean(current_gains) if current_gains else None
                 ),
                 "stage24_retention_vs_stage0": (
                     stage24["output_throughput_tok_s"]
@@ -173,8 +171,8 @@ def main() -> int:
     correctness_ok = bool(all_mtp_rows) and all(
         row.get("output_matches_baseline") is True for row in all_mtp_rows
     )
-    combo_complete = any(
-        item["arm"] in {"mtp_combo", "mtp_combo_inproc"}
+    deferred_complete = any(
+        item["arm"] in {"mtp_deferred", "mtp_deferred_inproc"}
         for item in serving_ranking
     )
 
@@ -188,7 +186,7 @@ def main() -> int:
         "best_pressure_arm": pressure_ranking[0] if pressure_ranking else None,
         "pressure_ranking": pressure_ranking,
         "correctness_gate_passed": correctness_ok,
-        "combo_complete": combo_complete,
+        "deferred_complete": deferred_complete,
         "errors": errors,
         "serving_rows": serving_rows,
         "pressure_rows": pressure_rows,
@@ -236,7 +234,9 @@ def main() -> int:
         if row.get("arm_config", {}).get("mode") == "mtp":
             by_workload[row["workload"]].append(row)
     for workload in sorted(by_workload):
-        row = max(by_workload[workload], key=lambda item: item["output_throughput_tok_s"])
+        row = max(
+            by_workload[workload], key=lambda item: item["output_throughput_tok_s"]
+        )
         lines.append(
             f"| {workload} | {row['arm']} | "
             f"{row['output_throughput_tok_s']:.2f} | "
@@ -276,7 +276,7 @@ def main() -> int:
     report = "\n".join(lines) + "\n"
     (args.output_dir / "combined_summary.md").write_text(report)
     print(report)
-    return 0 if correctness_ok and combo_complete else 2
+    return 0 if correctness_ok and deferred_complete else 2
 
 
 if __name__ == "__main__":

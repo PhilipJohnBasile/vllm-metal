@@ -8,7 +8,7 @@ This work built the missing correctness path and then treated performance as an 
 
 The first complete hosted serving matrix produced an important negative result: native MTP was correct and functional, but the downstream vLLM Metal proposal/verification/state path was slower than the matched prefix-cached baseline on every workload. That result narrowed the problem from “does Qwen MTP work?” to “which state-motion and orchestration costs dominate Metal serving?”
 
-The next matrix tests two measured code-level interventions—copyless speculative state and deferred compact GDN state—alone and together, with deterministic-output gates and matched baselines.
+The next matrix treats the now-upstream copyless speculative-state path as part of the current implementation and isolates the remaining deferred compact GDN-state intervention, with deterministic-output gates and matched baselines.
 
 ## Why this problem matters
 
@@ -100,12 +100,10 @@ A full-pool-preallocation control was only 0.701x as fast as compact deferred st
 The current matrix starts from the best scheduler configuration and compares:
 
 1. matched non-MTP baseline;
-2. current native MTP;
+2. current native MTP, including copyless speculative state;
 3. MTP plus deferred compact GDN state;
-4. MTP plus copyless speculative state;
-5. MTP plus copyless and deferred state;
-6. combined state optimizations plus verification-window mode;
-7. matched in-process baseline/combined arms with V1 multiprocessing disabled.
+4. deferred state plus verification-window mode;
+5. matched in-process baseline/deferred arms with V1 multiprocessing disabled.
 
 Workloads include short and 8K shared prefixes, concurrency 1/4/8/16, and retained-prefix pressure at 0/8/24 cached prefixes.
 

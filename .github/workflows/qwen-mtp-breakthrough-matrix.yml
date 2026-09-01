@@ -15,7 +15,6 @@ on:
       - .github/workflows/qwen-mtp-breakthrough-matrix.yml
       - benchmarks/qwen_mtp_breakthrough_matrix.py.gz
       - benchmarks/qwen_mtp_breakthrough_aggregate.py
-      - benchmarks/patches/qwen_mtp_copyless_gdn.patch
       - vllm_metal/experimental/gdn_deferred_decode_state.py
       - vllm_metal/envs.py
 
@@ -35,8 +34,8 @@ env:
 
 jobs:
   validate-candidates:
-    name: validate-copyless-plus-deferred
-    runs-on: macos-15
+    name: validate-deferred-candidate
+    runs-on: macos-26
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
@@ -68,11 +67,9 @@ jobs:
               'baseline_start',
               'mtp_current',
               'mtp_deferred',
-              'mtp_copyless',
-              'mtp_combo',
-              'mtp_combo_verify',
+              'mtp_deferred_verify',
               'baseline_inproc_start',
-              'mtp_combo_inproc',
+              'mtp_deferred_inproc',
               'baseline_inproc_end',
               'baseline_end',
           }
@@ -99,15 +96,11 @@ jobs:
           ensure_metal_toolchain
           build_native_artifacts
 
-      - name: Apply copyless candidate and run focused correctness suite
+      - name: Run focused correctness suite
         shell: bash
         run: |
           set -euxo pipefail
           source .venv/bin/activate
-          git apply --check --whitespace=nowarn \
-            benchmarks/patches/qwen_mtp_copyless_gdn.patch
-          git apply --whitespace=nowarn \
-            benchmarks/patches/qwen_mtp_copyless_gdn.patch
           python -m py_compile \
             vllm_metal/attention/impls/gdn_lazy.py \
             vllm_metal/attention/impls/linear.py \
@@ -123,7 +116,7 @@ jobs:
   benchmark:
     name: ${{ matrix.name }}
     needs: validate-candidates
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 300
     strategy:
       fail-fast: false
@@ -132,42 +125,42 @@ jobs:
           - name: serving-short
             mode: serving
             workloads: interactive_c1,serving_c4
-            arms: baseline_start,mtp_current,mtp_deferred,mtp_copyless,mtp_combo,baseline_inproc_start,mtp_combo_inproc,baseline_inproc_end,baseline_end
+            arms: baseline_start,mtp_current,mtp_deferred,baseline_inproc_start,mtp_deferred_inproc,baseline_inproc_end,baseline_end
             max_model_len: "1280"
             max_num_seqs: "4"
             retained_prefixes: "0"
           - name: serving-scale
             mode: serving
             workloads: serving_c8,serving_c16
-            arms: baseline_start,mtp_current,mtp_deferred,mtp_copyless,mtp_combo,mtp_combo_verify,baseline_inproc_start,mtp_combo_inproc,baseline_inproc_end,baseline_end
+            arms: baseline_start,mtp_current,mtp_deferred,mtp_deferred_verify,baseline_inproc_start,mtp_deferred_inproc,baseline_inproc_end,baseline_end
             max_model_len: "1280"
             max_num_seqs: "16"
             retained_prefixes: "0"
           - name: serving-long
             mode: serving
             workloads: long_prefix_c1,long_prefix_c4
-            arms: baseline_start,mtp_current,mtp_deferred,mtp_copyless,mtp_combo,mtp_combo_verify,baseline_inproc_start,mtp_combo_inproc,baseline_inproc_end,baseline_end
+            arms: baseline_start,mtp_current,mtp_deferred,mtp_deferred_verify,baseline_inproc_start,mtp_deferred_inproc,baseline_inproc_end,baseline_end
             max_model_len: "8448"
             max_num_seqs: "4"
             retained_prefixes: "0"
           - name: pressure-0
             mode: pressure
             workloads: interactive_c1
-            arms: baseline_start,mtp_current,mtp_deferred,mtp_copyless,mtp_combo,baseline_end
+            arms: baseline_start,mtp_current,mtp_deferred,baseline_end
             max_model_len: "1280"
             max_num_seqs: "4"
             retained_prefixes: "0"
           - name: pressure-8
             mode: pressure
             workloads: interactive_c1
-            arms: baseline_start,mtp_current,mtp_deferred,mtp_copyless,mtp_combo,baseline_end
+            arms: baseline_start,mtp_current,mtp_deferred,baseline_end
             max_model_len: "1280"
             max_num_seqs: "4"
             retained_prefixes: "8"
           - name: pressure-24
             mode: pressure
             workloads: interactive_c1
-            arms: baseline_start,mtp_current,mtp_deferred,mtp_copyless,mtp_combo,baseline_end
+            arms: baseline_start,mtp_current,mtp_deferred,baseline_end
             max_model_len: "1280"
             max_num_seqs: "4"
             retained_prefixes: "24"
@@ -195,9 +188,7 @@ jobs:
           gzip -t benchmarks/qwen_mtp_breakthrough_matrix.py.gz
           gzip -dc benchmarks/qwen_mtp_breakthrough_matrix.py.gz > "$RUNNER_SCRIPT"
           python -m py_compile "$RUNNER_SCRIPT"
-          sha256sum \
-            "$RUNNER_SCRIPT" \
-            benchmarks/patches/qwen_mtp_copyless_gdn.patch
+          sha256sum "$RUNNER_SCRIPT"
 
       - name: Cache converted benchmark model
         id: model-cache
@@ -282,7 +273,6 @@ jobs:
           python "$RUNNER_SCRIPT" \
             --model-dir "$MODEL_DIR" \
             --output-dir "$RESULT_DIR" \
-            --copyless-patch benchmarks/patches/qwen_mtp_copyless_gdn.patch \
             --mode '${{ matrix.mode }}' \
             --arms '${{ matrix.arms }}' \
             --workloads '${{ matrix.workloads }}' \
