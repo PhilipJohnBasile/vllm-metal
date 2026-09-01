@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
     VLLM_METAL_RING_BASE_PORT: int = 32323
+    VLLM_METAL_MIN_FREE_FRACTION: float = 0.15
+    VLLM_METAL_DISABLE_MEMORY_GUARD: bool = False
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of unified memory to use.  "auto" (the default) means the
@@ -103,6 +105,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # mlx.launch's starting_port. See distributed.md#pipeline-parallelism.
     "VLLM_METAL_RING_BASE_PORT": lambda: int(
         os.getenv("VLLM_METAL_RING_BASE_PORT", "32323")
+    ),
+    # Keep a host-memory floor outside the wired Metal KV-cache allocation.
+    # The hard cannot-fit guard remains active when the soft floor is disabled.
+    "VLLM_METAL_MIN_FREE_FRACTION": lambda: float(
+        os.getenv("VLLM_METAL_MIN_FREE_FRACTION", "0.15")
+    ),
+    "VLLM_METAL_DISABLE_MEMORY_GUARD": lambda: (
+        os.getenv("VLLM_METAL_DISABLE_MEMORY_GUARD", "0") == "1"
     ),
 }
 

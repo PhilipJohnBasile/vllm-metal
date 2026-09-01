@@ -261,9 +261,26 @@ def test_make_private_dir_does_not_chmod_existing(tmp_path: Path) -> None:
 def _fake_spec(block_bytes: int):
     from types import SimpleNamespace
 
+    group = SimpleNamespace(tokens_per_block=16, layer_names=("layer0",))
     return SimpleNamespace(
         block_size_factor=1,
+        blocks_per_chunk=1,
         kv_bytes_per_offloaded_block=block_bytes,
+        kv_events_config=SimpleNamespace(enable_kv_cache_events=False),
+        config=SimpleNamespace(
+            groups=(group,),
+            model=SimpleNamespace(name="test-model", dtype="float16"),
+            cache=SimpleNamespace(tokens_per_hash=16),
+            parallel=SimpleNamespace(
+                tp_size=1,
+                pp_size=1,
+                pcp_size=1,
+                dcp_size=1,
+                rank=0,
+                is_parallelism_agnostic=True,
+            ),
+            replicated_layout=False,
+        ),
         vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(model="test-model", dtype="float16"),
             cache_config=SimpleNamespace(block_size=16, cache_dtype="auto"),

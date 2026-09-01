@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 import mlx.core as mx
+import psutil
 import torch
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import (
@@ -19,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 
+import vllm_metal.envs as envs
 from vllm_metal.attention.caches.mha_layout import MHAKVCacheLayout
 from vllm_metal.attention.caches.turboquant import (
     BLOCK_SIZE as TQ_BLOCK_SIZE,
@@ -1103,6 +1105,63 @@ class ModelCachePolicy:
 class WorkerCachePlanner:
     """Worker-owned cache budgeting and paged-attention setup."""
 
+    MEMORY_GUARD_SLACK_BYTES = 4 << 30
+    MEMORY_GUARD_MIN_FREE_BYTES = 4 << 30
+    MEMORY_GUARD_HARD_FREE_BYTES = 1 << 30
+
+    @classmethod
+    def compute_safe_kv_budget(
+        cls,
+        requested_kv_bytes: int,
+        *,
+        planned_other_bytes: int,
+        available_bytes: int,
+        total_bytes: int,
+        min_free_fraction: float = 0.15,
+        guard_disabled: bool = False,
+    ) -> tuple[int, str | None]:
+        """Clamp a prospective wired KV pool against live host memory.
+
+        ``available_bytes`` already excludes the resident model and profiling
+        allocations. ``planned_other_bytes`` is reserved for allocations that
+        have not happened yet. The cannot-fit cut is unconditional; disabling
+        the guard only opts out of the softer free-memory floor.
+        """
+        requested = max(0, int(requested_kv_bytes))
+        planned_other = max(0, int(planned_other_bytes))
+        available = max(0, int(available_bytes))
+        total = max(0, int(total_bytes))
+        free_fraction = min(1.0, max(0.0, float(min_free_fraction)))
+
+        # Flat reserves are too aggressive on small CI Macs. Preserve the
+        # 4 GiB soft floor on 16 GiB-class hosts while scaling its minimum and
+        # the planning slack below that point.
+        slack = min(cls.MEMORY_GUARD_SLACK_BYTES, total // 16)
+        hard_floor = cls.MEMORY_GUARD_HARD_FREE_BYTES
+        hard_limit = max(0, available - planned_other - slack - hard_floor)
+
+        limit = hard_limit
+        reason_kind: str | None = None
+        if requested > hard_limit:
+            reason_kind = "cannot-fit"
+
+        if not guard_disabled:
+            absolute_floor = min(cls.MEMORY_GUARD_MIN_FREE_BYTES, total // 4)
+            soft_floor = max(absolute_floor, int(total * free_fraction))
+            soft_limit = max(0, available - planned_other - slack - soft_floor)
+            limit = min(limit, soft_limit)
+            if requested > limit and reason_kind is None:
+                reason_kind = "clamped"
+
+        budget = min(requested, limit)
+        if reason_kind is None:
+            return budget, None
+        return (
+            budget,
+            f"{reason_kind}: requested {requested} bytes, safe host-memory "
+            f"budget {budget} bytes",
+        )
+
     def __init__(self, worker: MetalWorker) -> None:
         self._worker = worker
 
@@ -1257,6 +1316,21 @@ class WorkerCachePlanner:
         )
         reservation = self._hybrid_gdn_reservation()
         kv_budget = base_kv_budget - reservation.total_bytes
+        if kv_budget > 0:
+            host_memory = psutil.virtual_memory()
+            kv_budget, guard_reason = self.compute_safe_kv_budget(
+                kv_budget,
+                # Model weights are already reflected in host_memory.available
+                # and must not be counted twice. Profiled cache overhead and
+                # the lazy hybrid reservation are allocations still to come.
+                planned_other_bytes=overhead + reservation.total_bytes,
+                available_bytes=host_memory.available,
+                total_bytes=host_memory.total,
+                min_free_fraction=envs.VLLM_METAL_MIN_FREE_FRACTION,
+                guard_disabled=envs.VLLM_METAL_DISABLE_MEMORY_GUARD,
+            )
+            if guard_reason is not None:
+                logger.warning("Paged attention host-memory guard: %s", guard_reason)
         plan = _PagedAttentionPlan(
             block_size=block_size,
             fraction=fraction,

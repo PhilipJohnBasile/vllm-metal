@@ -13,6 +13,16 @@ from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
 )
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    ensure_kv_transfer_shutdown,
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorHandshakeMetadata,
+)
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
@@ -95,7 +105,7 @@ class MetalWorker(WorkerBase):
         # Apply TurboQuant config from --additional-config (needed because worker
         # runs in a separate process and doesn't inherit the config singleton
         # state set in MetalPlatform.check_and_update_config).
-        add = vllm_config.additional_config
+        add = getattr(vllm_config, "additional_config", None) or {}
         if isinstance(add, dict) and add.get("turboquant"):
             self.metal_config.turboquant = True
             self.metal_config.k_quant = add.get("k_quant", "q8_0")
@@ -249,7 +259,27 @@ class MetalWorker(WorkerBase):
         Args:
             kv_cache_config: KV cache configuration for this worker
         """
+        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
+        if has_kv_transfer_group():
+            if not hasattr(self.model_runner, "register_kv_connector_caches"):
+                raise NotImplementedError(
+                    "KV offloading is not supported for STT models on Metal."
+                )
+            self.model_runner.register_kv_connector_caches()
+
+    def get_kv_connector_handshake_metadata(
+        self,
+    ) -> dict[tuple[int, int], KVConnectorHandshakeMetadata] | None:
+        """Return connector handshake metadata keyed by (PP rank, TP rank)."""
+        if not has_kv_transfer_group():
+            return None
+
+        connector = get_kv_transfer_group()
+        if (metadata := connector.get_handshake_metadata()) is None:
+            return None
+
+        return {(get_pp_group().rank_in_group, get_tp_group().rank_in_group): metadata}
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         """Warm up the model for inference."""
@@ -394,6 +424,11 @@ class MetalWorker(WorkerBase):
 
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup resources."""
+        try:
+            ensure_kv_transfer_shutdown()
+        except Exception:
+            logger.exception("KV transfer shutdown failed; continuing")
+
         if self._metal_profiler is not None:
             self._metal_profiler.shutdown()
             self._metal_profiler = None
