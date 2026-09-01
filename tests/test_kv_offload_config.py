@@ -19,6 +19,7 @@ def _base_config(**cache_overrides) -> SimpleNamespace:
     cache_config = SimpleNamespace(
         block_size=None,
         enable_prefix_caching=False,
+        gpu_memory_utilization=0.9,
         kv_offloading_size=None,
         kv_offloading_backend="native",
         # vLLM 0.25.1: populated by --kv-cache-dtype turboquant_*; Metal
