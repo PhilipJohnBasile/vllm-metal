@@ -161,7 +161,13 @@ def main() -> int:
         # Compile/warm the same path before timed work.  The warmup prompt is
         # unique and therefore cannot accidentally become a hit for a probe.
         llm.generate(
-            [{"prompt_token_ids": _build_prompt(tokenizer, 900_000, args.prompt_tokens)}],
+            [
+                {
+                    "prompt_token_ids": _build_prompt(
+                        tokenizer, 900_000, args.prompt_tokens
+                    )
+                }
+            ],
             populate_params,
         )
 
@@ -218,7 +224,10 @@ def main() -> int:
                 mlx_peak_bytes=_memory_value(mx, "get_peak_memory"),
             )
             results.append(result)
-            print("GDN_COLD_PROBE=" + json.dumps(asdict(result), sort_keys=True), flush=True)
+            print(
+                "GDN_COLD_PROBE=" + json.dumps(asdict(result), sort_keys=True),
+                flush=True,
+            )
     finally:
         GDNPagedStateCache.ensure_capacity = original_ensure_capacity
 
