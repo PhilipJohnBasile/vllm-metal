@@ -1,0 +1,203 @@
+name: GDN Preallocation Probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [perf/gdn-deferred-decode-state]
+    paths:
+      - vllm_metal/experimental/gdn_preallocate_probe.py
+      - vllm_metal/envs.py
+      - vllm_metal/__init__.py
+      - .github/workflows/gdn-preallocation-probe.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gdn-preallocation-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      MODEL_DIR: /tmp/Qwen3.5-0.8B-4bit-mtp
+      RESULT_DIR: /tmp/gdn-preallocation-probe
+      MLX_LM_REF: ac6aaffd8fdfb8c8e713e17f155d83e3d72b0a0f
+      GLOO_SOCKET_IFNAME: lo0
+      VLLM_METAL_USE_PAGED_ATTENTION: "1"
+      VLLM_METAL_MEMORY_FRACTION: auto
+      VLLM_METAL_GDN_LAZY_KERNELS: "1"
+      VLLM_METAL_DECODE_PIPELINE: "1"
+      VLLM_ENABLE_V1_MULTIPROCESSING: "0"
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.MODEL_DIR }}
+          key: qwen35-08b-4bit-mtp-${{ env.MLX_LM_REF }}
+
+      - name: Install current source stack
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip uv
+          python -m pip install \
+            'https://github.com/vllm-project/vllm/releases/download/v0.27.1/vllm-0.27.1%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl'
+          VLLM_METAL_BUILD_FROM_SOURCE=1 python -m pip install -e '.[dev]'
+          python -m pip install --force-reinstall --no-deps \
+            "git+https://github.com/PhilipJohnBasile/mlx-lm@${MLX_LM_REF}"
+          source scripts/lib.sh
+          ensure_metal_toolchain
+          build_native_artifacts
+
+      - name: Prepare model
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          if [ ! -f "$MODEL_DIR/config.json" ]; then
+            rm -rf "$MODEL_DIR"
+            python -m mlx_lm convert \
+              --hf-path Qwen/Qwen3.5-0.8B \
+              --mlx-path "$MODEL_DIR" \
+              -q --q-bits 4 --q-group-size 64
+          fi
+
+      - name: Run steady-state allocation arms
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source .venv/bin/activate
+          rm -rf "$RESULT_DIR"
+          mkdir -p "$RESULT_DIR"
+
+          VLLM_METAL_GDN_DEFER_DECODE_STATE=0 \
+          VLLM_METAL_GDN_PREALLOCATE_CHECKPOINTS=0 \
+            python tools/benchmark/gdn_align_cold_scaling.py \
+              --model "$MODEL_DIR" --mode off \
+              --output "$RESULT_DIR/cache-off.json" \
+              --prompt-tokens 1152 --probe-output-tokens 64 \
+              --stages 0,8,24 --max-num-seqs 8 \
+              --max-num-batched-tokens 2048 \
+              2>&1 | tee "$RESULT_DIR/cache-off.log"
+
+          VLLM_METAL_GDN_DEFER_DECODE_STATE=1 \
+          VLLM_METAL_GDN_PREALLOCATE_CHECKPOINTS=0 \
+            python tools/benchmark/gdn_align_cold_scaling.py \
+              --model "$MODEL_DIR" --mode on \
+              --output "$RESULT_DIR/deferred.json" \
+              --prompt-tokens 1152 --probe-output-tokens 64 \
+              --stages 0,8,24 --max-num-seqs 8 \
+              --max-num-batched-tokens 2048 \
+              2>&1 | tee "$RESULT_DIR/deferred.log"
+
+          VLLM_METAL_GDN_DEFER_DECODE_STATE=1 \
+          VLLM_METAL_GDN_PREALLOCATE_CHECKPOINTS=1 \
+            python tools/benchmark/gdn_align_cold_scaling.py \
+              --model "$MODEL_DIR" --mode on \
+              --output "$RESULT_DIR/preallocated.json" \
+              --prompt-tokens 1152 --probe-output-tokens 64 \
+              --stages 0,8,24 --max-num-seqs 8 \
+              --max-num-batched-tokens 2048 \
+              2>&1 | tee "$RESULT_DIR/preallocated.log"
+
+      - name: Compare probe
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import math
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ['RESULT_DIR'])
+          root.mkdir(parents=True, exist_ok=True)
+          names = ('cache-off', 'deferred', 'preallocated')
+          data = {}
+          for name in names:
+              path = root / f'{name}.json'
+              if path.exists():
+                  data[name] = json.loads(path.read_text())
+          if len(data) != len(names):
+              missing = sorted(set(names) - set(data))
+              report = '# GDN preallocation probe\n\nMissing arms: ' + ', '.join(missing) + '\n'
+              (root / 'summary.md').write_text(report)
+              print(report)
+              raise SystemExit(0)
+
+          indexed = {
+              name: {row['retained_prompt_target']: row for row in arm['results']}
+              for name, arm in data.items()
+          }
+          stages = sorted(indexed['deferred'])
+          parity = all(
+              indexed['deferred'][stage]['output_sha256']
+              == indexed['preallocated'][stage]['output_sha256']
+              for stage in stages
+          )
+          ratios = [
+              indexed['preallocated'][stage]['wall_output_tok_s']
+              / indexed['deferred'][stage]['wall_output_tok_s']
+              for stage in stages
+          ]
+          geomean = math.prod(ratios) ** (1 / len(ratios))
+          lines = [
+              '# GDN preallocation probe',
+              '',
+              f'- Output parity: **{parity}**',
+              f'- Geometric-mean preallocated/deferred: **{geomean:.3f}x**',
+              '',
+              '| Retained | Cache-off | Deferred | Deferred + prealloc | Prealloc/deferred | Prealloc/off |',
+              '|---:|---:|---:|---:|---:|---:|',
+          ]
+          rows = []
+          for stage, ratio in zip(stages, ratios, strict=True):
+              off = indexed['cache-off'][stage]['wall_output_tok_s']
+              deferred = indexed['deferred'][stage]['wall_output_tok_s']
+              preallocated = indexed['preallocated'][stage]['wall_output_tok_s']
+              rows.append({
+                  'stage': stage,
+                  'cache_off_tok_s': off,
+                  'deferred_tok_s': deferred,
+                  'preallocated_tok_s': preallocated,
+                  'preallocated_vs_deferred': ratio,
+                  'preallocated_vs_cache_off': preallocated / off,
+              })
+              lines.append(
+                  f'| {stage} | {off:.3f} | {deferred:.3f} | {preallocated:.3f} | '
+                  f'{ratio:.3f}x | {preallocated / off:.3f}x |'
+              )
+          summary = {
+              'parity': parity,
+              'geomean_preallocated_vs_deferred': geomean,
+              'rows': rows,
+              'raw': data,
+          }
+          (root / 'summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+          report = '\n'.join(lines) + '\n'
+          (root / 'summary.md').write_text(report)
+          print(report)
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as handle:
+              handle.write(report)
+          if not parity:
+              raise SystemExit('preallocation changed deterministic output')
+          PY
+
+      - name: Upload probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdn-preallocation-probe
+          path: ${{ env.RESULT_DIR }}
+          if-no-files-found: warn

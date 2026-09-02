@@ -140,6 +140,20 @@ def _register() -> str | None:
 
     apply_compat_patches()
 
+    if os.getenv("VLLM_METAL_GDN_DEFER_DECODE_STATE", "0") == "1":
+        from vllm_metal.experimental.gdn_deferred_decode_state import (
+            apply_deferred_gdn_state_patch,
+        )
+
+        apply_deferred_gdn_state_patch()
+
+    if os.getenv("VLLM_METAL_GDN_PREALLOCATE_CHECKPOINTS", "0") == "1":
+        from vllm_metal.experimental.gdn_preallocate_probe import (
+            apply_gdn_preallocation_probe,
+        )
+
+        apply_gdn_preallocation_probe()
+
     from vllm_metal.platform import MetalPlatform
 
     if MetalPlatform.is_available():

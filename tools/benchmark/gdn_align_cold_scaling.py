@@ -16,6 +16,7 @@ throughput can be correlated with the align-mode high-water pool.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -40,6 +41,7 @@ class ProbeResult:
     mlx_active_bytes: int | None
     mlx_cache_bytes: int | None
     mlx_peak_bytes: int | None
+    output_sha256: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -204,7 +206,11 @@ def main() -> int:
                 probe_params,
             )[0]
             wall_time = time.perf_counter() - probe_started
-            generated = len(output.outputs[0].token_ids)
+            generated_ids = list(output.outputs[0].token_ids)
+            generated = len(generated_ids)
+            output_sha256 = hashlib.sha256(
+                json.dumps(generated_ids, separators=(",", ":")).encode()
+            ).hexdigest()
             ttft, decode_time, e2e = _metric_times(output)
             decode_tok_s = None
             if decode_time is not None and decode_time > 0 and generated > 1:
@@ -222,6 +228,7 @@ def main() -> int:
                 mlx_active_bytes=_memory_value(mx, "get_active_memory"),
                 mlx_cache_bytes=_memory_value(mx, "get_cache_memory"),
                 mlx_peak_bytes=_memory_value(mx, "get_peak_memory"),
+                output_sha256=output_sha256,
             )
             results.append(result)
             print(
@@ -234,6 +241,10 @@ def main() -> int:
     output = {
         "mode": args.mode,
         "enable_prefix_caching": enable_prefix_caching,
+        "defer_decode_state": os.getenv(
+            "VLLM_METAL_GDN_DEFER_DECODE_STATE", "0"
+        )
+        == "1",
         "model": args.model,
         "hardware": {
             "platform": platform.platform(),
