@@ -51,11 +51,7 @@ def _has_speculative_state_chains() -> bool:
     ctx = get_context()
     if ctx is None or ctx.gdn_group_state_chains is None:
         return False
-    return any(
-        bool(chain)
-        for group in ctx.gdn_group_state_chains
-        for chain in group
-    )
+    return any(bool(chain) for group in ctx.gdn_group_state_chains for chain in group)
 
 
 def _should_defer_decode_state() -> bool:
@@ -69,14 +65,26 @@ def _try_conv_decode(
     state_cache: Any,
     cache_idx: int,
     slot_ids: list[int],
+    write_slot_ids: list[int] | None = None,
 ) -> mx.array | None:
     """Run lazy conv decode while retaining compact state when safe."""
+    # Speculative chains own stable checkpoint destinations. Keep the current
+    # native implementation (including its copyless writes and validation) for
+    # those calls instead of applying the ordinary-decode state handoff.
+    if write_slot_ids is not None or not _should_defer_decode_state():
+        return _ORIGINALS["try_conv_decode"](
+            self,
+            mixed_qkv,
+            inner,
+            state_cache,
+            cache_idx,
+            slot_ids,
+            write_slot_ids=write_slot_ids,
+        )
     num_requests = len(slot_ids)
     total_tokens = mixed_qkv.shape[1]
     if not (
-        self._enabled
-        and self._conv_kernel is not None
-        and total_tokens == num_requests
+        self._enabled and self._conv_kernel is not None and total_tokens == num_requests
     ):
         return None
 
@@ -135,6 +143,8 @@ def _try_recurrent_decode(
     request: lazy_mod.GDNRecurrentDecodeRequest,
 ) -> mx.array | None:
     """Run lazy recurrent decode while retaining compact state when safe."""
+    if request.write_slot_ids is not None or not _should_defer_decode_state():
+        return _ORIGINALS["try_recurrent_decode"](self, request)
     total_tokens = request.total_tokens
     n_hk = request.num_key_heads
     n_hv = request.num_value_heads
@@ -259,9 +269,7 @@ def _can_skip_initial_pool_flush(
                 return False
             row = state_block_ids[req_idx][group]
             src_idx = (num_computed - 1) // manager._block_size
-            dst_idx = (
-                num_computed + num_scheduled - 1
-            ) // manager._block_size
+            dst_idx = (num_computed + num_scheduled - 1) // manager._block_size
             if max(src_idx, dst_idx) >= len(row):
                 return False
             if row[src_idx] != row[dst_idx]:
@@ -282,13 +290,9 @@ def _record_request_slots(
         raise RuntimeError(
             "deferred GDN request-slot tracking received a malformed mapping"
         )
-    registry: dict[str, tuple[int, ...]] = getattr(
-        manager, _REQUEST_SLOTS_ATTR, {}
-    )
+    registry: dict[str, tuple[int, ...]] = getattr(manager, _REQUEST_SLOTS_ATTR, {})
     for req_idx, req_id in enumerate(req_ids):
-        registry[req_id] = tuple(
-            int(group[req_idx]) for group in mappings
-        )
+        registry[req_id] = tuple(int(group[req_idx]) for group in mappings)
     setattr(manager, _REQUEST_SLOTS_ATTR, registry)
 
 
@@ -308,8 +312,7 @@ def _populate_step_context(
     self._deferred_gdn_flush_after_step = bool(
         _step_has_speculation(self, ctx, positions)
         or any(
-            num_scheduled > 0
-            and (num_computed + num_scheduled) % self._block_size == 0
+            num_scheduled > 0 and (num_computed + num_scheduled) % self._block_size == 0
             for num_computed, num_scheduled in positions
         )
     )
@@ -451,9 +454,7 @@ def _release_requests(self: AlignGDNStateManager, req_ids: set[str]) -> None:
         _ORIGINALS["align_release_requests"](self, req_ids)
         return
 
-    registry: dict[str, tuple[int, ...]] = getattr(
-        self, _REQUEST_SLOTS_ATTR, {}
-    )
+    registry: dict[str, tuple[int, ...]] = getattr(self, _REQUEST_SLOTS_ATTR, {})
     released_mappings: list[tuple[int, ...]] = []
     missing_mapping = False
     for req_id in req_ids:
@@ -479,9 +480,7 @@ def _release_requests(self: AlignGDNStateManager, req_ids: set[str]) -> None:
                 for group in range(num_groups)
             }
             released_by_group = {
-                group: {
-                    mapping[group] for mapping in released_mappings
-                }
+                group: {mapping[group] for mapping in released_mappings}
                 - remaining_by_group[group]
                 for group in range(num_groups)
             }
@@ -528,9 +527,7 @@ def remove_deferred_gdn_state_patch_for_tests() -> None:
     if not _PATCHED:
         return
     lazy_mod.GDNLazyKernels.try_conv_decode = _ORIGINALS["try_conv_decode"]
-    lazy_mod.GDNLazyKernels.try_recurrent_decode = _ORIGINALS[
-        "try_recurrent_decode"
-    ]
+    lazy_mod.GDNLazyKernels.try_recurrent_decode = _ORIGINALS["try_recurrent_decode"]
     AlignGDNStateManager.populate_step_context = _ORIGINALS[
         "align_populate_step_context"
     ]

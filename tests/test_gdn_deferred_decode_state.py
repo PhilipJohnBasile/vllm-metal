@@ -185,6 +185,62 @@ def test_decode_replaces_compact_recurrent_state_without_touching_pool() -> None
     np.testing.assert_allclose(np.array(cache.recurrent_states[0][3]), 4)
 
 
+@pytest.mark.parametrize("destination", [3, 4])
+def test_explicit_conv_destination_uses_stable_checkpoint(destination: int) -> None:
+    cache = _cache()
+    pool = cache.conv_states[0]
+    pool[3] = mx.full_like(pool[3], 2)
+    cache.store_conv_state(0, pool)
+    inner = SimpleNamespace(
+        conv_kernel_size=2,
+        conv1d=SimpleNamespace(weight=mx.ones((4, 1), dtype=mx.float32)),
+    )
+    assert (
+        _lazy().try_conv_decode(
+            mx.ones((1, 1, 4), dtype=mx.float32),
+            inner,
+            cache,
+            0,
+            [3],
+            write_slot_ids=[destination],
+        )
+        is not None
+    )
+    assert not cache.has_pending_conv_state(0)
+    np.testing.assert_allclose(np.array(cache.conv_states[0][destination]), 3)
+    if destination != 3:
+        np.testing.assert_allclose(np.array(cache.conv_states[0][3]), 2)
+
+
+@pytest.mark.parametrize("destination", [3, 4])
+def test_explicit_recurrent_destination_uses_stable_checkpoint(
+    destination: int,
+) -> None:
+    cache = _cache()
+    pool = cache.recurrent_states[0]
+    pool[3] = mx.full_like(pool[3], 2)
+    cache.store_recurrent_state(0, pool)
+    request = GDNRecurrentDecodeRequest(
+        q=mx.zeros((1, 1, 1, 32), dtype=mx.float32),
+        k=mx.zeros((1, 1, 1, 32), dtype=mx.float32),
+        v=mx.zeros((1, 1, 1, 4), dtype=mx.float32),
+        g=mx.zeros((1, 1, 1), dtype=mx.float32),
+        beta=mx.zeros((1, 1, 1), dtype=mx.float32),
+        state_cache=cache,
+        cache_idx=0,
+        slot_ids=[3],
+        output_dtype=mx.float32,
+        write_slot_ids=[destination],
+    )
+    assert _lazy().try_recurrent_decode(request) is not None
+    # Native recurrent decoding may defer the destination update; materialize
+    # it before checking both destination and rollback source contents.
+    cache.apply_pending_recurrent_state(0)
+    np.testing.assert_allclose(np.array(cache.recurrent_states[0][destination]), 3)
+    if destination != 3:
+        np.testing.assert_allclose(np.array(cache.recurrent_states[0][3]), 2)
+
+
 def test_align_materialize_keeps_compact_state_until_checkpoint_boundary() -> None:
     cache = _cache()
     manager = AlignGDNStateManager(cache, block_size=4)
@@ -213,9 +269,7 @@ def test_align_materialize_keeps_compact_state_until_checkpoint_boundary() -> No
 def test_same_block_align_step_does_not_drain_pending_state() -> None:
     cache = _cache()
     manager = AlignGDNStateManager(cache, block_size=4)
-    cache.set_pending_conv_state(
-        0, [3], mx.full((1, 1, 4), 7, dtype=mx.float32)
-    )
+    cache.set_pending_conv_state(0, [3], mx.full((1, 1, 4), 7, dtype=mx.float32))
     cache.set_pending_recurrent_state(
         0, [3], mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
     )
@@ -242,9 +296,7 @@ def test_same_block_align_step_does_not_drain_pending_state() -> None:
 def test_block_transition_flushes_pending_state_before_copy() -> None:
     cache = _cache()
     manager = AlignGDNStateManager(cache, block_size=4)
-    cache.set_pending_conv_state(
-        0, [3], mx.full((1, 1, 4), 7, dtype=mx.float32)
-    )
+    cache.set_pending_conv_state(0, [3], mx.full((1, 1, 4), 7, dtype=mx.float32))
     cache.set_pending_recurrent_state(
         0, [3], mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
     )
@@ -311,9 +363,7 @@ def test_release_keeps_row_still_owned_by_another_request() -> None:
         "left": (3,),
         "right": (3,),
     }
-    cache.set_pending_conv_state(
-        0, [3], mx.full((1, 1, 4), 7, dtype=mx.float32)
-    )
+    cache.set_pending_conv_state(0, [3], mx.full((1, 1, 4), 7, dtype=mx.float32))
     cache.set_pending_recurrent_state(
         0, [3], mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
     )
@@ -330,9 +380,7 @@ def test_release_keeps_row_still_owned_by_another_request() -> None:
 def test_missing_release_mapping_retains_safe_force_flush_fallback() -> None:
     cache = _cache()
     manager = AlignGDNStateManager(cache, block_size=4)
-    cache.set_pending_conv_state(
-        0, [3], mx.full((1, 1, 4), 7, dtype=mx.float32)
-    )
+    cache.set_pending_conv_state(0, [3], mx.full((1, 1, 4), 7, dtype=mx.float32))
     cache.set_pending_recurrent_state(
         0, [3], mx.full((1, 1, 4, 32), 9, dtype=mx.float32)
     )
